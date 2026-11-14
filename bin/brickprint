@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Launcher for the brickprint package.  Set BRICKPRINT_PYTHON to override.
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}"
+
+if [[ -n "${BRICKPRINT_PYTHON:-}" ]]; then
+    PY="$BRICKPRINT_PYTHON"
+elif [[ -x /Applications/Blender.app/Contents/Resources/5.2/python/bin/python3.13 ]]; then
+    PY=/Applications/Blender.app/Contents/Resources/5.2/python/bin/python3.13
+elif [[ -x /Applications/Blender.app/Contents/Resources/5.1/python/bin/python3.11 ]]; then
+    PY=/Applications/Blender.app/Contents/Resources/5.1/python/bin/python3.11
+else
+    PY=python3
+fi
+
+exec "$PY" -m brickprint "$@"

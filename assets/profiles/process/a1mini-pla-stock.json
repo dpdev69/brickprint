@@ -1,0 +1,17 @@
+{
+  "kind": "process",
+  "name": "a1mini-pla-stock",
+  "description": "Default: Bambu stock A1 mini 0.4 + PLA Basic + 0.20mm Standard, unmodified (the checked-in snapshot assets/a1mini_pla_project_settings.json). Support-needing parts go to '<Colour> supports' plates.",
+  "base": "snapshot",
+  "supports": {
+    "mode": "plates"
+  },
+  "bridging": {
+    "mode": "stock"
+  },
+  "fit": {
+    "contour": 0,
+    "hole": 0
+  },
+  "overrides": {}
+}

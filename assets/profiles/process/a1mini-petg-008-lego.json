@@ -1,0 +1,67 @@
+{
+  "kind": "process",
+  "name": "a1mini-petg-008-lego",
+  "description": "A1 mini 0.4, 0.08 mm, slow PETG walls, LEGO clutch fit, short-span bridges, enforcer-only supports (the verified Seagull v4 recipe).",
+  "printer": "Bambu Lab A1 mini 0.4 nozzle",
+  "base_process": "0.08mm Extra Fine @BBL A1M",
+  "default_filament": "Bambu PETG Basic @BBL A1M 0.4 nozzle",
+  "bed_type": "Textured PEI Plate",
+  "fit": {
+    "contour": 0.03,
+    "hole": -0.03
+  },
+  "supports": {
+    "mode": "enforcers",
+    "protrusion_mm": 0.8,
+    "margin_mm": 0.2,
+    "below_mm": 0.3,
+    "above_mm": 0.6
+  },
+  "bridging": {
+    "mode": "short-span",
+    "x_long_angle": 90
+  },
+  "lego_safety": {
+    "thick_bridges": "0"
+  },
+  "overrides": {
+    "bottom_shell_layers": 5,
+    "bridge_angle": 180,
+    "bridge_speed": 25,
+    "brim_type": "outer_only",
+    "enable_prime_tower": 0,
+    "enable_support": 1,
+    "gap_infill_speed": 80,
+    "initial_layer_infill_speed": 30,
+    "initial_layer_speed": 25,
+    "inner_wall_acceleration": 3000,
+    "inner_wall_speed": 100,
+    "internal_solid_infill_speed": 100,
+    "outer_wall_acceleration": 2000,
+    "outer_wall_speed": 50,
+    "skeleton_infill_density": "5%",
+    "skin_infill_density": "5%",
+    "sparse_infill_density": "30%",
+    "sparse_infill_speed": 120,
+    "support_base_pattern": "rectilinear",
+    "support_base_pattern_spacing": 1,
+    "support_interface_pattern": "rectilinear_interlaced",
+    "support_interface_spacing": 0.3,
+    "support_interface_speed": 40,
+    "support_interface_top_layers": 3,
+    "support_object_xy_distance": 0.4,
+    "support_on_build_plate_only": 1,
+    "support_remove_small_overhang": 0,
+    "support_speed": 60,
+    "support_top_z_distance": 0.24,
+    "support_type": "normal(manual)",
+    "thick_bridges": 0,
+    "top_shell_layers": 6,
+    "top_surface_speed": 80,
+    "travel_speed": 400,
+    "wall_generator": "arachne",
+    "wall_loops": 4,
+    "wall_sequence": "inner-outer-inner wall"
+  },
+  "provenance": "Seagull MMMB027-1 v4 (seagull/build_fit_v2.py + build_overhang_v4.py), CLI-verified 2026-11-10"
+}

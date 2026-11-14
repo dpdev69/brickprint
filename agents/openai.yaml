@@ -1,0 +1,4 @@
+interface:
+  display_name: "Brickprint"
+  short_description: "LEGO set number → color-grouped multi-plate 3MF"
+  default_prompt: "Use $brickprint to turn LEGO set 10337-1 into a color-grouped multi-plate Bambu Studio 3MF."
