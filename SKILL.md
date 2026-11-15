@@ -166,6 +166,7 @@ Print tuning (all optional; without them the output is byte-identical to the sto
 - `--bridging short-span|stock` — bridge cavity ceilings across the short side.
 - `--ceilings recipe8|off` — socket-ceiling recipe (on in `a1mini-petg-008-lego-v8`): plate sockets raised to 2.2 mm, the ceiling printed as two 0.24 mm layers with thick bridges and 2 wall loops on the bridge layer, plus 0.8 mm ribs where a bridge span exceeds 7 mm. Every part becomes its own Bambu object (height ranges are per object), and parts with support enforcers are packed with extra spacing. Needs `thick_bridges=1`; never set that without this recipe, or strands block the studs.
 - `--set KEY=VALUE` — any Bambu process key. It is shaped and listed in `different_settings_to_system` automatically. The value kind (whole number, number, percent) is checked against the stock value; a wrong kind such as `wall_loops=4.5` is rejected with an error. Enums and free strings are accepted as-is. `--fit` / `calibrate --values` contour must be 0 to 0.3 mm.
+- `--support-set KEY=VALUE` — extra per-object Bambu setting written only on objects with their own tree supports (`<Colour> supports` plates, auto-supported fit-test pieces), e.g. `support_top_z_distance=0.64`. Repeatable; overrides a profile's `supports.object_settings` per key. `enable_support` / `support_type` / `bridge_no_support` are fixed and rejected.
 - `--allow-shrink` — accept `filament_shrink` > 100 % (otherwise an error: it scales parts down).
 - `--verify [--reference REF.3mf]` — slice the result and run `verify`.
 

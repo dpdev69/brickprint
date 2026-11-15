@@ -56,6 +56,8 @@ How the settings are written (`brickprint/settings.py`):
 
 `--set KEY=VALUE` adds any process key through the same rules. Value kinds are checked against the stock value (whole number, number, percent); enums and free strings are not.
 
+`--support-set KEY=VALUE` (repeatable) adds a per-object key only to objects with their own tree supports (supports plates, auto-supported fit-test pieces); a profile can supply defaults in `"supports": {"object_settings": {...}}`, the CLI wins per key. Example: `support_top_z_distance=0.64` — with `thick_bridges=1` the first line over a tree-support interface is a 0.4 mm strand, so the global 0.32 leaves almost no air (PETG fuses); 0.64 gives the 0.32 mm real gap enforcer supports get (G-code measured on Enzo plate 12; not yet print-confirmed). The base keys `enable_support`, `support_type`, `bridge_no_support` cannot be overridden.
+
 ## Fit (clutch)
 
 LDraw geometry has zero stud/socket interference, so FDM clutch comes from Bambu's

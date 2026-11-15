@@ -254,6 +254,7 @@ def _apply_options(cfg, args) -> None:
             cfg[key] = val
     cfg["filaments"] = list(getattr(args, "filament", None) or [])
     cfg["set"] = list(getattr(args, "set_kv", None) or [])
+    cfg["support_set"] = list(getattr(args, "support_set", None) or [])
     cfg["allow_shrink"] = bool(getattr(args, "allow_shrink", False))
     cfg["_composer"] = None
 
@@ -644,7 +645,7 @@ def cmd_build(args):
             first = plates[0]
             objs = _test_objects(meshes, test_files, max(cfg["gap"], 6.0),
                                  min(cfg["bed"], cfg["depth"]) - 2 * cfg["margin"], label="fit test ",
-                                 metadata_for=lambda pf: (dict(threemf.AUTO_SUPPORT_META)
+                                 metadata_for=lambda pf: (threemf.support_metadata(cfg)
                                                           if meshes[pf]["needs_support"] else {}))
             if objs is None:
                 raise SystemExit("--fit-test pieces do not fit on one plate")
@@ -893,6 +894,7 @@ def cmd_verify(args):
         s = json.loads(rep.read_text())["settings"]
         cfg.update({"profile": s["profile"], "fit": f"{s['fit']['contour']},{s['fit']['hole']}",
                     "set": [f"{k}={v}" for k, v in s.get("set", {}).items()],
+                    "support_set": [f"{k}={v}" for k, v in s.get("support_set", {}).items()],
                     "supports": s.get("supports"), "bridging": s.get("bridging"),
                     "filaments": [], "_composer": None})
         expected = _expected(cfg)
@@ -1173,6 +1175,11 @@ def _tuning_args(p, fit: bool = True) -> None:
     g.add_argument("--set", dest="set_kv", action="append", metavar="KEY=VALUE",
                    help="expert: any Bambu process key (shaped to Bambu's type and listed in "
                         "different_settings_to_system); repeatable")
+    g.add_argument("--support-set", dest="support_set", action="append", metavar="KEY=VALUE",
+                   help="expert: extra per-object Bambu setting, written ONLY on objects with "
+                        "their own tree supports (supports plates, auto-supported fit-test "
+                        "pieces), e.g. support_top_z_distance=0.64; overrides the profile's "
+                        "supports.object_settings per key; repeatable")
     g.add_argument("--allow-shrink", action="store_true",
                    help="accept filament_shrink above 100%% (it scales parts DOWN)")
     g.add_argument("--part-map", help="JSON rebrickable part -> LDraw part (adds to "
