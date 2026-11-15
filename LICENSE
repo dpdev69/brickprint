@@ -20,10 +20,3 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-
----
-
-The MIT License above covers brickprint's own code, tests and documentation.
-It does not cover assets/a1mini_pla_project_settings.json, which is derived
-from Bambu Studio and is licensed under the GNU Affero General Public License
-v3.0. See THIRD_PARTY_NOTICES.md and LICENSES/AGPL-3.0.txt.
