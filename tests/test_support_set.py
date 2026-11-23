@@ -34,7 +34,9 @@ class SupportMetadata(unittest.TestCase):
         self.assertEqual(threemf.support_metadata(cfg)["support_top_z_distance"], "0.64")
         comp = threemf.composer(cfg)
         self.assertFalse(comp.legacy)
-        self.assertEqual(comp.summary()["support_set"], {"support_top_z_distance": "0.64"})
+        # summary() records the Bambu Studio version; no install needed here
+        with mock.patch("brickprint.bambu_profiles.app_version", return_value="0.0.0"):
+            self.assertEqual(comp.summary()["support_set"], {"support_top_z_distance": "0.64"})
 
     def test_base_key_override_rejected(self):
         for kv in ("enable_support=0", "support_type=normal(auto)", "bridge_no_support=0"):

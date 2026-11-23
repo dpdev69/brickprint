@@ -19,8 +19,11 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        python-version: ["3.9", "3.12"]
+        python-version: ["3.12"]
         include:
+          # oldest supported Python; ubuntu-latest no longer ships 3.9
+          - os: ubuntu-24.04
+            python-version: "3.9"
           # the tool is macOS-first
           - os: macos-latest
             python-version: "3.12"
