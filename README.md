@@ -186,8 +186,9 @@ brickprint/
   agents/openai.yaml
   bin/brickprint           launcher
   brickprint/
-    cli.py                 subcommands
-    config.py              paths, doctor
+    cli.py                 argument parsing, subcommand dispatch
+    pipeline.py            build / verify / calibrate orchestration
+    config.py              paths, printer presets (--preset), doctor
     rebrickable.py         CSV download + inventory
     ldraw.py               LDraw resolution + LDView mesh cache
     pack.py                MaxRects packing
