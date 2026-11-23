@@ -40,3 +40,6 @@ target-version = "py39"
 [tool.ruff.lint]
 # ruff's default rule set
 select = ["E4", "E7", "E9", "F"]
+# style-only rules the existing numeric code does not follow (single-letter
+# names such as `l`, `a; b` one-liners, small lambdas)
+ignore = ["E702", "E731", "E741"]

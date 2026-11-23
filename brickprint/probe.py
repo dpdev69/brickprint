@@ -32,7 +32,6 @@ instant and any mesh or policy change re-probes only what changed.
 from __future__ import annotations
 
 import json
-import math
 import os
 import re
 import shutil
