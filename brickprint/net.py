@@ -10,29 +10,36 @@ from pathlib import Path
 
 
 def download(url: str, dest: Path, timeout: int = 300) -> None:
+    dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_name(dest.name + ".tmp")
+    last_error: BaseException | None = None
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "brickprint/1.0"})
-        with urllib.request.urlopen(req, timeout=timeout) as response, open(tmp, "wb") as f:
-            shutil.copyfileobj(response, f)
-        os.replace(tmp, dest)
-        return
-    except Exception as exc:  # noqa: BLE001 - fall through to curl/wget
-        last_error = exc
-    for cmd in (
-        ["curl", "-fsSL", "--retry", "3", "-o", str(tmp), url],
-        ["wget", "-q", "-O", str(tmp), url],
-    ):
-        if not shutil.which(cmd[0]):
-            continue
+        tmp.unlink(missing_ok=True)  # stale partial from an earlier crashed run
         try:
-            subprocess.run(cmd, check=True, timeout=timeout,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            req = urllib.request.Request(url, headers={"User-Agent": "brickprint/1.0"})
+            with urllib.request.urlopen(req, timeout=timeout) as response, open(tmp, "wb") as f:
+                shutil.copyfileobj(response, f)
             os.replace(tmp, dest)
             return
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 - fall through to curl/wget
             last_error = exc
-    if tmp.exists():
-        tmp.unlink()
-    raise RuntimeError(f"download failed for {url}: {last_error}")
+            tmp.unlink(missing_ok=True)
+        for cmd in (
+            ["curl", "-fsSL", "--retry", "3", "-o", str(tmp), url],
+            ["wget", "-q", "-O", str(tmp), url],
+        ):
+            if not shutil.which(cmd[0]):
+                continue
+            try:
+                subprocess.run(cmd, check=True, timeout=timeout,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                os.replace(tmp, dest)
+                return
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                tmp.unlink(missing_ok=True)
+        raise RuntimeError(f"download failed for {url}: {last_error}")
+    finally:
+        # no ".tmp" survives any exit path (success has already renamed it)
+        tmp.unlink(missing_ok=True)
