@@ -287,17 +287,12 @@ def test_ensure_data_refresh_redownloads_everything(cache):
 # rebrickable.py uses urllib.error without importing it (ruff F821): any download error makes
 # the `except (urllib.error.URLError, ...)` clause itself raise NameError.  Remove the marker
 # once that import is fixed.
-_URLLIB_IMPORT_BUG = pytest.mark.xfail(raises=NameError, reason="rebrickable.py lacks `import urllib.error`")
-
-
-@_URLLIB_IMPORT_BUG
 def test_ensure_data_missing_file_and_failed_download_exits(tmp_path):
-    with mock.patch.object(rb, "download", side_effect=OSError("offline")):
+    with mock.patch.object(rb, "download", side_effect=RuntimeError("download failed: offline")):
         with pytest.raises(SystemExit, match="could not download"):
             rb.ensure_data(tmp_path)
 
 
-@_URLLIB_IMPORT_BUG
 def test_ensure_data_keeps_cached_file_when_refresh_fails(cache, capsys):
     for name in rb.FILES:
         if not (cache / name).exists():

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import csv
 import gzip
-import re
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -45,7 +44,7 @@ def ensure_data(cache_dir: Path, refresh: bool = False) -> None:
         if refresh or stale:
             try:
                 _download(name, dest)
-            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            except (RuntimeError, TimeoutError, OSError) as exc:  # net.download raises RuntimeError
                 if not dest.is_file():
                     raise SystemExit(f"could not download {name}: {exc}") from exc
                 print(f"warning: keeping cached {name}: {exc}")
