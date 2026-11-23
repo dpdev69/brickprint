@@ -45,6 +45,8 @@ stay empty). brickprint then auto-detects them at run time (for example
 skill for that `ldraw_library/ldraw` layout). You can also run
 `bin/brickprint` straight from the clone without installing.
 
+For development, `pip install -e ".[dev]"` installs a `brickprint` console script plus pytest and ruff; it must stay an editable/source-checkout install, because the bundled `assets/` live outside the package directory and a regular (non-editable) wheel would not contain them.
+
 Then check the setup and fix what is missing:
 
 ```bash

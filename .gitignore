@@ -3,3 +3,9 @@ __pycache__/
 .DS_Store
 *.bak*
 .*.tmp
+*.egg-info/
+build/
+dist/
+.venv/
+.pytest_cache/
+.ruff_cache/

@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "brickprint"
+dynamic = ["version"]
+description = "Turn a LEGO set into a colour-grouped, multi-plate Bambu Studio 3MF."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+# numpy is the only third-party import in brickprint/*.py; the rest is stdlib.
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+brickprint = "brickprint.cli:main"
+
+# NOTE: brickprint locates its bundled data (assets/, references/) relative to
+# the source tree (config.SKILL_ROOT = <repo>/..., i.e. OUTSIDE the package
+# directory). It therefore works from a source checkout, an editable install
+# (`pip install -e .`) or the skill layout from install.sh, but a regular
+# (non-editable) wheel would NOT contain assets/ and cannot run the full tool.
+[tool.setuptools.packages.find]
+include = ["brickprint*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "brickprint.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py39"
+
+[tool.ruff.lint]
+# ruff's default rule set
+select = ["E4", "E7", "E9", "F"]
