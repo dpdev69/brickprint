@@ -52,7 +52,7 @@ __all__ = [
 
 
 def cmd_doctor(args):
-    cfg = config.load_config()
+    cfg = config.load_config(preset=getattr(args, "preset", None))
     return config.doctor(cfg)
 
 
@@ -87,7 +87,7 @@ def cmd_profiles(args):
 
 
 def cmd_validate(args):
-    cfg = config.load_config()
+    cfg = config.load_config(preset=getattr(args, "preset", None))
     stats = threemf.validate_project(Path(args.file), float(args.bed or cfg["bed"]), float(args.depth or cfg["depth"]))
     print(f"plates {stats['plate_count']}  components {stats['components']}  triangles {stats['triangles']}")
     for p in stats["plates"]:
@@ -99,6 +99,13 @@ def cmd_validate(args):
     if args.slice:
         print("use `brickprint verify FILE` to slice and check the project.")
     return 0 if stats["bad_plates"] == 0 else 1
+
+
+def _preset_arg(p) -> None:
+    p.add_argument("--preset", type=str.lower, choices=config.preset_names(),
+                   help="printer / bed preset (default: BRICKPRINT_PRESET, else \"preset\" in the "
+                        f"config, else {config.DEFAULT_PRESET}); bed, depth, "
+                        "filament and settings set in the config or by flags still win")
 
 
 def _tuning_args(p, fit: bool = True) -> None:
@@ -143,6 +150,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = ap.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("doctor", help="check paths and dependencies")
+    _preset_arg(p)
     p.set_defaults(func=cmd_doctor)
 
     p = sub.add_parser("bootstrap", help="download Rebrickable + LDraw data")
@@ -163,6 +171,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out")
     p.add_argument("--name")
     p.add_argument("--orient", help="JSON file of part -> Rx/Ry/Rx2/Ry2")
+    _preset_arg(p)
     p.add_argument("--bed", type=float)
     p.add_argument("--depth", type=float)
     p.add_argument("--margin", type=float)
@@ -204,6 +213,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--bambu", action="store_true", help="normalise with Bambu Studio (thumbnails)")
     p.add_argument("--no-probe", dest="probe", action="store_false")
     p.add_argument("--verify", action="store_true", help="slice and measure every row")
+    _preset_arg(p)
     _tuning_args(p, fit=False)
     p.set_defaults(func=cmd_calibrate, probe=True)
 
@@ -240,10 +250,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fit", help="show --resolved: fit")
     p.add_argument("--to", help="export: target directory (never Bambu's user folders)")
     p.add_argument("--out", help="regen-template: write here instead of the skill asset")
+    _preset_arg(p)
     p.set_defaults(func=cmd_profiles)
 
     p = sub.add_parser("validate", help="check a generated 3MF")
     p.add_argument("file")
+    _preset_arg(p)
     p.add_argument("--bed", type=float)
     p.add_argument("--depth", type=float)
     p.add_argument("--slice", action="store_true")

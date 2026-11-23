@@ -286,7 +286,7 @@ def _prepare_meshes(cfg, unique_files, overrides, use_probe: bool, cache=None):
         probe_report["skipped"] = "Bambu Studio not found"
     else:
         verdicts, pstats = probe.probe(
-            cfg, prepared, probe.VerdictCache(cache.root), bambu)
+            cfg, prepared, probe.VerdictCache(_verdict_root(cfg, cache.root)), bambu)
         probe_report = {"used": True, **pstats}
         print(f"probe: {pstats['parts_verified']}/{pstats['parts']} parts verified by "
               f"Bambu Studio ({pstats['cached']} poses cached, {pstats['probed']} probed, "
@@ -518,9 +518,108 @@ def _auto_test_parts(merged, feats, skip=()) -> list[str]:
     return pick or files[:3]
 
 
+def _verdict_root(cfg, root: Path) -> Path:
+    """Probe verdict cache folder.  The A1 mini keeps the historic folder; a
+    stock template of another printer has the same verdict fingerprint
+    (settings.Composer.fingerprint is '' for every snapshot build), so its
+    verdicts live apart."""
+    name = cfg.get("preset") or config.DEFAULT_PRESET
+    if name == config.DEFAULT_PRESET:
+        return root
+    sub = Path(root) / f"preset_{name}"
+    sub.mkdir(parents=True, exist_ok=True)
+    return sub
+
+
+def _exclusion_shift(cfg) -> tuple[float, float]:
+    """(dx, dy) to move every plate's layout so nothing lands in the printer
+    preset's bed exclusion zone (P1S / X1C: the front-left purge corner,
+    x 0-18, y 0-28 mm; Bambu refuses such a plate with "Object conflicts
+    were detected").  The packer gets a bed smaller by the same amount;
+    the shift goes along the axis that costs less.  (0, 0) for the A1 / A1
+    mini (no exclusion zone)."""
+    area = config.PRESETS[cfg.get("preset") or config.DEFAULT_PRESET].get("bed_exclude_area")
+    if not area:
+        return 0.0, 0.0
+    (x0, y0), (x1, y1) = area
+    margin = float(cfg["margin"])
+    dx = max(0.0, x1 + 1.0 - margin)
+    dy = max(0.0, y1 + 1.0 - margin)
+    if dx == 0.0 or dy == 0.0:
+        return 0.0, 0.0
+    shift = (dx, 0.0) if dx <= dy else (0.0, dy)
+    if not cfg.get("_exclusion_noted"):
+        cfg["_exclusion_noted"] = True
+        print(f"bed exclusion zone x {x0:g}-{x1:g} / y {y0:g}-{y1:g} mm ({cfg['preset']}): "
+              f"layouts start {margin + shift[0]:g} mm from the left / "
+              f"{margin + shift[1]:g} mm from the front")
+    return shift
+
+
+def _shift_plates(plates, dx: float, dy: float) -> None:
+    """Move every item (plate, colour group, fit-test object) and the prime
+    tower position by (dx, dy) mm."""
+    if not dx and not dy:
+        return
+
+    def move(items):
+        return [(pf, x + dx, y + dy, w, d) for pf, x, y, w, d in items]
+
+    for plate in plates:
+        plate["items"] = move(plate["items"])
+        for g in plate.get("groups") or []:
+            g["items"] = move(g["items"])
+        for o in plate.get("objects") or []:
+            o["items"] = move(o["items"])
+        if plate.get("tower"):
+            tx, ty = plate["tower"]
+            plate["tower"] = (round(tx + dx, 3), round(ty + dy, 3))
+
+
+def _check_preset(cfg, comp) -> None:
+    """Stop before the slow steps when the printer preset and the settings
+    disagree: a process profile written for another printer (the bundled
+    a1mini-petg-* profiles), a filament profile whose Bambu base preset does
+    not list the preset's printer, or a missing derived template."""
+    from . import bambu_profiles as bp
+    name = cfg.get("preset") or config.DEFAULT_PRESET
+    machine = config.PRESETS[name]["machine"]
+    printer = comp.profile.get("printer") if not comp.snapshot else None
+    if printer and printer != machine:
+        msg = (f"process profile {comp.name} is written for {printer!r}, but the printer "
+               f"preset is {name} ({machine!r})")
+        if name != config.DEFAULT_PRESET:
+            raise SystemExit(f"--preset: {msg}; use a profile with \"printer\": {machine!r} "
+                             f"(its base_process / default_filament must be {machine} presets) "
+                             f"or the stock default (a1mini-pla-stock, which takes the "
+                             f"preset's own stock template)")
+        print(f"WARNING: {msg}")
+    if name == config.DEFAULT_PRESET:
+        return
+    config.require_settings(cfg)
+    if comp.snapshot:
+        try:
+            have = json.loads(Path(cfg["settings"]).read_text()).get("printer_settings_id")
+        except (OSError, ValueError):
+            have = None
+        if have and have != machine:
+            print(f"WARNING: settings template {cfg['settings']} is for {have!r}, but the "
+                  f"printer preset is {name} ({machine!r}); the template wins")
+    for spec in comp.filament_specs:
+        fp = settings.load_profile("filament", spec.split("=", 1)[-1].strip())
+        base = fp.get("base_filament")
+        if not base:
+            continue
+        compat = bp.raw_chain(comp.app, "filament", base).get("compatible_printers") or []
+        if machine not in compat:
+            raise SystemExit(f"--filament {spec}: base preset {base!r} is not a {machine} "
+                             f"preset (preset {name}); write a filament profile whose "
+                             f"base_filament is one of the {config.PRESETS[name]['short']} presets")
+
+
 def run_build(args):
     t0 = time.time()
-    cfg = config.load_config()
+    cfg = config.load_config(preset=getattr(args, "preset", None))
     for key, attr in (("bed", "bed"), ("depth", "depth"), ("margin", "margin"), ("gap", "gap")):
         if getattr(args, key, None) is not None:
             cfg[key] = float(getattr(args, key))
@@ -528,6 +627,7 @@ def run_build(args):
     sweep.maybe_sweep(cfg)
     _apply_options(cfg, args)
     comp = threemf.composer(cfg)
+    _check_preset(cfg, comp)
 
     overrides = _load_orient(args.orient)
     part_map = ldraw.load_part_map(getattr(args, "part_map", None))
@@ -591,7 +691,7 @@ def run_build(args):
     meshes, probe_report, bambu = _prepare_meshes(cfg, unique_files, overrides, args.probe, cache)
     feats = _apply_features(cfg, meshes) if not comp.legacy else {}
     if feats and probe_report.get("used"):
-        vcache = probe.VerdictCache(cache.root)
+        vcache = probe.VerdictCache(_verdict_root(cfg, cache.root))
         _check_ribs(cfg, bambu, meshes, feats, vcache)
         _screen_final(cfg, bambu, meshes, feats, vcache)
     needs_support = sorted(f for f, m in meshes.items() if m["needs_support"])
@@ -609,6 +709,7 @@ def run_build(args):
         print("  add a manual Rx/Ry override with --orient if the part should lie flat")
 
     tower = pack.TOWER_KEEPOUT if _prime_tower_on(comp) else None
+    sx, sy = _exclusion_shift(cfg)
 
     def layout():
         instances = [
@@ -625,7 +726,7 @@ def run_build(args):
         # a --fit-test plate is appended after packing: keep a grid slot free for it
         plates, oversized, _ = pack.pack(
             instances, colors,
-            bed=cfg["bed"], depth=cfg["depth"],
+            bed=cfg["bed"] - sx, depth=cfg["depth"] - sy,
             margin=cfg["margin"], gap=cfg["gap"],
             max_plates=pack.MAX_PLATES - (1 if getattr(args, "fit_test", None) else 0),
             mix=getattr(args, "mix_colours", None) or "auto",
@@ -640,7 +741,8 @@ def run_build(args):
         if getattr(args, "fit_test", None):
             first = plates[0]
             objs = _test_objects(meshes, test_files, max(cfg["gap"], 6.0),
-                                 min(cfg["bed"], cfg["depth"]) - 2 * cfg["margin"], label="fit test ",
+                                 min(cfg["bed"] - sx, cfg["depth"] - sy) - 2 * cfg["margin"],
+                                 label="fit test ",
                                  metadata_for=lambda pf: (threemf.support_metadata(cfg)
                                                           if meshes[pf]["needs_support"] else {}))
             if objs is None:
@@ -655,6 +757,7 @@ def run_build(args):
                 "support": "", "items": [it for o in objs for it in o["items"]], "objects": objs,
                 "bbox": (0, 0),
             })
+        _shift_plates(plates, sx, sy)
         return plates, oversized
 
     if getattr(args, "fit_test", None) and not test_files:
@@ -790,6 +893,7 @@ def run_build(args):
         "plates_csv": str(plates_csv),
         "missing_csv": str(out_path.with_name(out_path.stem + "_missing.csv")) if missing else None,
         "seconds": round(time.time() - t0, 1),
+        "preset": cfg.get("preset"),
     }
     if not comp.legacy:
         rows = quality.report(cache, unique_files)
@@ -907,7 +1011,7 @@ def run_verify(args):
 def run_calibrate(args):
     """One project, one object per (fit value, test part); per-object X-Y
     compensation (Bambu honours it per object, not per part)."""
-    cfg = config.load_config()
+    cfg = config.load_config(preset=getattr(args, "preset", None))
     config.ensure_dirs(cfg)
     _apply_options(cfg, args)
     threemf.composer(cfg)
@@ -934,12 +1038,13 @@ def run_calibrate(args):
         cfg["filaments"] = [spec]
         colour["rgb"] = (fp.get("colour") or "#CCCCCC").lstrip("#")
     cfg["_composer"] = None
-    threemf.composer(cfg)   # build the composer for the final options
+    _check_preset(cfg, threemf.composer(cfg))
     _check_profile(cfg, {"cal": colour})
     meshes, probe_report, bambu = _prepare_meshes(cfg, sorted(set(files)), _load_orient(None),
                                                   args.probe)
     _apply_features(cfg, meshes)   # mutates meshes (enforcers, ribs, ...)
-    width = min(cfg["bed"], cfg["depth"]) - 2 * cfg["margin"]
+    sx, sy = _exclusion_shift(cfg)
+    width = min(cfg["bed"] - sx, cfg["depth"] - sy) - 2 * cfg["margin"]
     gap = 6.0
     # rows of test pieces, one row per value
     objs, y = [], 0.0
@@ -974,6 +1079,7 @@ def run_calibrate(args):
                        "is_trans": False, "index": i, "count": len(plates_objs), "kind": "",
                        "support": "", "items": [it for o in objs for it in o["items"]],
                        "objects": objs, "bbox": (0, 0)})
+    _shift_plates(plates, sx, sy)
     out = Path(args.out)
     raw = out.with_name(out.stem + "_raw.3mf")
     threemf.write_project(cfg, {"set_num": "fit-calibration", "name": "brickprint fit calibration"},
@@ -1020,7 +1126,8 @@ def run_quality(args):
 
 
 def run_profiles(args):
-    cfg = config.load_config()
+    cfg = config.load_config(preset=getattr(args, "preset", None))
+    preset = config.PRESETS[cfg["preset"]]
     if args.action == "list":
         for kind, items in settings.list_profiles().items():
             print(f"{kind}:")
@@ -1034,6 +1141,7 @@ def run_profiles(args):
         if not args.resolved:
             print(json.dumps({k: v for k, v in prof.items() if k != "_path"}, indent=2, ensure_ascii=False))
             return 0
+        config.require_settings(cfg)
         cfg["profile"] = args.name if kind == "process" else None
         cfg["filaments"] = [args.name] if kind == "filament" else list(args.filament or [])
         cfg["fit"] = args.fit
@@ -1052,14 +1160,15 @@ def run_profiles(args):
         return _profiles_check()
     if args.action == "export":
         prof = settings.load_profile("filament", args.name)
+        config.require_settings(cfg)
         cfg["filaments"] = [args.name]
         cfg["set"] = []
         comp = settings.Composer(cfg)
         S = comp.compose([{"color_id": "1", "color_name": "x", "hex": "CCCCCC"}])
-        out = {"type": "filament", "name": f"{prof.get('display', prof['name'])} @ A1M",
+        out = {"type": "filament", "name": f"{prof.get('display', prof['name'])} @ {preset['short']}",
                "inherits": prof["base_filament"], "from": "User", "instantiation": "true",
                "filament_id": S["filament_ids"][0],
-               "compatible_printers": [comp.profile.get("printer", "Bambu Lab A1 mini 0.4 nozzle")]}
+               "compatible_printers": [comp.profile.get("printer", preset["machine"])]}
         for k in prof.get("overrides", {}):
             out[k] = S[k] if isinstance(S[k], list) else [S[k]]
         if not args.to:
@@ -1079,7 +1188,8 @@ def run_profiles(args):
     if args.action == "regen-template":
         from . import bambu_profiles as bp
         app = bp.app_from_exe(cfg.get("bambu"))
-        text = bp.template_text(bp.build_template(app))
+        text = bp.template_text(bp.build_template(app, preset["machine"], preset["process"],
+                                                  preset["filament_settings_id"]))
         target = Path(cfg["settings"]) if not args.out else Path(args.out)
         old = target.read_text() if target.is_file() else ""
         if old == text:

@@ -83,7 +83,8 @@ A part is skipped when its footprint exceeds `bed - 2×margin`. A 32×32 basepla
 needs a 256 mm bed, for example. Use:
 
 ```bash
-brickprint build SET --bed 256 --depth 256
+brickprint build SET --preset x1c          # 256 mm printer with its own settings
+brickprint build SET --bed 256 --depth 256 # bed size only
 ```
 
 or split the set.
