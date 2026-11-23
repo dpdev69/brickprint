@@ -37,7 +37,7 @@ more than 2 % on the first differing criterion.  ``needs_support`` is set when
 the chosen orientation still has floating regions (or, if every pose has
 one, an empty layer; such parts are reported and must be checked by hand).
 
-Shared verbatim by tools/orient.py and brickprint/orient.py.
+This module is the single source of the orientation emulator.
 """
 
 from __future__ import annotations

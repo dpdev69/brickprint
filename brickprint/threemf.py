@@ -62,7 +62,7 @@ def _mesh_object(oid: int, V: np.ndarray, T: np.ndarray) -> str:
     )
 
 
-def _support_metadata(plate: dict) -> str:
+def _support_metadata(plate: dict, cfg: dict | None = None) -> str:
     """Per-object overrides in model_settings.config for support plates.
 
     Project settings keep enable_support=0; only "<Colour> supports" plates
@@ -71,11 +71,8 @@ def _support_metadata(plate: dict) -> str:
     """
     if not plate.get("support"):
         return ""
-    return (
-        '<metadata key="enable_support" value="1"/>'
-        '<metadata key="support_type" value="tree(auto)"/>'
-        '<metadata key="bridge_no_support" value="1"/>'
-    )
+    return "".join(f'<metadata key="{xml_escape(k)}" value="{xml_escape(v)}"/>'
+                   for k, v in support_metadata(cfg).items())
 
 
 def _plate_model(entries: list[str]) -> str:
@@ -141,6 +138,15 @@ def composer(cfg: dict):
 
 
 AUTO_SUPPORT_META = {"enable_support": "1", "support_type": "tree(auto)", "bridge_no_support": "1"}
+
+
+def support_metadata(cfg: dict | None = None) -> dict:
+    """Per-object settings of an object with its own tree supports: the base
+    keys plus the --support-set / profile ``supports.object_settings`` extras."""
+    meta = dict(AUTO_SUPPORT_META)
+    if cfg is not None:
+        meta.update(composer(cfg).support_set)
+    return meta
 
 
 def _plate_objects(plate: dict, plate_name: str, per_part: bool = False) -> list[dict]:
@@ -407,7 +413,7 @@ def write_project(
                 if len(obj["items"]) == 1 and meshes[obj["items"][0][0]].get("object_meta"):
                     meta = {**meshes[obj["items"][0][0]]["object_meta"], **meta}
                 if obj.get("_legacy_support"):
-                    meta_xml = _support_metadata(plate)
+                    meta_xml = _support_metadata(plate, cfg)
                 else:
                     meta_xml = "".join(f'<metadata key="{xml_escape(k)}" value="{xml_escape(v)}"/>'
                                        for k, v in meta.items())

@@ -126,7 +126,10 @@ brickprint build 10337-1 --no-bambu
 # do not print supports-off plates from this without checking them)
 brickprint build 10337-1 --no-bambu --no-probe
 
-# another Bambu printer / bed
+# another Bambu printer (bed size + its stock Bambu project settings)
+brickprint build 10337-1 --preset x1c
+
+# custom bed size only (keeps the A1 mini settings template)
 brickprint build 10337-1 --bed 256 --depth 256 --no-bambu
 
 # local BOM instead of Rebrickable
@@ -145,7 +148,8 @@ Outputs next to the requested `.3mf`:
 
 Options:
 
-- `--bed/--depth/--margin/--gap` — bed geometry (default 180/180/6/1 mm).
+- `--preset a1mini|a1|p1s|x1c` — printer preset (default `a1mini`; also `"preset"` in `~/.config/brickprint/config.json` or `BRICKPRINT_PRESET`; `--preset` > `BRICKPRINT_PRESET` > config). Sets the bed (A1 mini 180×180, A1 / P1S / X1C 256×256 mm), the stock filament (`Bambu PLA Basic @BBL …`) and the project-settings template: the A1 mini uses the bundled snapshot; the others are derived from the installed Bambu Studio's stock 0.4 mm machine + `0.20mm Standard` + PLA Basic presets (cached per Bambu version; the build stops with a clear error when Bambu Studio is missing). P1S / X1C layouts keep clear of the 18×28 mm front-left exclusion zone. Values set explicitly in the config (`bed`, `depth`, `settings`, `filament_settings_id`, …), `BRICKPRINT_SETTINGS` and flags such as `--bed` still win. The bundled `a1mini-petg-*` profiles and `porima-*` filament profiles are A1 mini presets; with another `--preset` the build refuses them (use the default stock profile). Also on `calibrate`, `validate`, `profiles` and `doctor`.
+- `--bed/--depth/--margin/--gap` — bed geometry (default from the preset: 180/180/6/1 mm for the A1 mini).
 - `--strict` — fail instead of continuing when an LDraw part is missing.
 - `--orient file.json` — `{"70490.dat": "Rx"}`; hard override for the built-in flat-lay list. The orientation engine only revisits an override when that pose is unprintable (floating/empty layer/edge contact).
   Labels are case-insensitive (`id`, `Rx`, `Rx2`, `Ry`, `Ry2`); an unknown label is an error.
@@ -166,6 +170,7 @@ Print tuning (all optional; without them the output is byte-identical to the sto
 - `--bridging short-span|stock` — bridge cavity ceilings across the short side.
 - `--ceilings recipe8|off` — socket-ceiling recipe (on in `a1mini-petg-008-lego-v8`): plate sockets raised to 2.2 mm, the ceiling printed as two 0.24 mm layers with thick bridges and 2 wall loops on the bridge layer, plus 0.8 mm ribs where a bridge span exceeds 7 mm. Every part becomes its own Bambu object (height ranges are per object), and parts with support enforcers are packed with extra spacing. Needs `thick_bridges=1`; never set that without this recipe, or strands block the studs.
 - `--set KEY=VALUE` — any Bambu process key. It is shaped and listed in `different_settings_to_system` automatically. The value kind (whole number, number, percent) is checked against the stock value; a wrong kind such as `wall_loops=4.5` is rejected with an error. Enums and free strings are accepted as-is. `--fit` / `calibrate --values` contour must be 0 to 0.3 mm.
+- `--support-set KEY=VALUE` — extra per-object Bambu setting written only on objects with their own tree supports (`<Colour> supports` plates, auto-supported fit-test pieces), e.g. `support_top_z_distance=0.64`. Repeatable; overrides a profile's `supports.object_settings` per key. `enable_support` / `support_type` / `bridge_no_support` are fixed and rejected.
 - `--allow-shrink` — accept `filament_shrink` > 100 % (otherwise an error: it scales parts down).
 - `--verify [--reference REF.3mf]` — slice the result and run `verify`.
 
@@ -227,7 +232,7 @@ Downloads the Rebrickable CSV dumps and, if no LDraw library is configured, down
 
 ### `doctor`
 
-Shows the resolved paths, the Python interpreter in use (`python bin`) and its numpy version, and fails loudly if the LDraw library, LDView, numpy, or settings template is missing.
+Shows the resolved paths, the active printer preset (`--preset` to check another one), the Python interpreter in use (`python bin`) and its numpy version, and fails loudly if the LDraw library, LDView, numpy, or settings template is missing.
 
 ## How to read the result
 
@@ -305,7 +310,7 @@ Shows the resolved paths, the Python interpreter in use (`python bin`) and its n
 - **LDraw coverage is not universal.** New molds, printed parts, minifig assemblies, and some large assemblies have no LDraw file. The tool reports them instead of guessing. Printed variants are simplified to the base mold where a parent relationship exists.
 - **Minifigs are not expanded by default.** Use `--include-minifigs`; leg/torso assemblies often remain missing.
 - **One color per plate** is the default for every project that fits on 36 plates. A set with many colors can produce many sparsely-filled plates; `--mix-colours always` puts tiny groups (a last plate at most 35 % full) together, up to 4 colours per plate, each colour a separate block and object. Large colour groups always keep their own plates.
-- **The A1 mini settings template is printer-specific.** For another printer, supply a matching Bambu project settings template and the correct bed size. The 3MF geometry and plate grid scale with `--bed/--depth`.
+- **Printer presets beyond the A1 mini use Bambu's stock settings only.** `--preset a1|p1s|x1c` builds with the stock 0.20 mm PLA chain of that printer; the tuned PETG / LEGO-fit profiles, the porima filament profiles and the ceilings recipe were calibrated on the A1 mini only. For any other printer, supply a matching Bambu project settings template (`settings` / `BRICKPRINT_SETTINGS`) and the correct bed size; the 3MF geometry and plate grid scale with `--bed/--depth`.
 - **Up to 36 plates** (Bambu's plate grid limit). A very large set may need to be split.
 - **Very color-heavy sets** may exceed the configured `max_filaments` (default 32). Split the project or raise the limit if the target Bambu version supports it.
 

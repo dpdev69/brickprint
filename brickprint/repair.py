@@ -190,7 +190,6 @@ def _split_tjunctions(V, T, tol=TJUNC_TOL, max_iter=TJUNC_MAX_ITER):
         L2 = (D ** 2).sum(axis=1)
         good = L2 > (2 * tol) ** 2
         splits = {}   # face -> (local edge position, vertex)
-        used_faces = set()
         # chunk over vertices to bound memory
         P = V[bverts]
         for s in range(0, len(bverts), 512):

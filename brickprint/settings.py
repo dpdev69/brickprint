@@ -130,6 +130,24 @@ def parse_set(items: list[str] | None) -> dict:
     return out
 
 
+def parse_support_set(profile_values: dict | None, items: list[str] | None) -> dict:
+    """Extra per-object settings for objects with their own tree supports:
+    profile ``supports.object_settings``, overridden per key by --support-set.
+    The base keys that turn those supports on cannot be changed here."""
+    from .threemf import AUTO_SUPPORT_META
+    out = {str(k).strip(): fmt(v) for k, v in (profile_values or {}).items()}
+    for kv in items or []:
+        if "=" not in kv or not kv.split("=", 1)[0].strip():
+            raise ProfileError(f"--support-set {kv!r}: expected key=value")
+        k, v = kv.split("=", 1)
+        out[k.strip()] = v.strip()
+    fixed = sorted(k for k in out if k in AUTO_SUPPORT_META)
+    if fixed:
+        raise ProfileError(f"--support-set / supports.object_settings: {', '.join(fixed)} cannot be "
+                           f"overridden (fixed: {', '.join(f'{k}={v}' for k, v in AUTO_SUPPORT_META.items())})")
+    return out
+
+
 MAX_FIT_MM = 0.3
 
 
@@ -218,9 +236,11 @@ class Composer:
         self.supports_mode = cfg.get("supports") or (self.profile.get("supports") or {}).get("mode", "plates")
         self.bridging_mode = cfg.get("bridging") or (self.profile.get("bridging") or {}).get("mode", "stock")
         self.ceilings_mode = cfg.get("ceilings") or (self.profile.get("ceilings") or {}).get("mode", "off")
+        self.support_set = parse_support_set((self.profile.get("supports") or {}).get("object_settings"),
+                                             cfg.get("support_set"))
         self.legacy = (self.snapshot and not self.profile.get("overrides")
                        and self.ceilings_mode == "off"
-                       and self.fit == (0.0, 0.0) and not self.sets
+                       and self.fit == (0.0, 0.0) and not self.sets and not self.support_set
                        and not self.filament_specs
                        and self.supports_mode == "plates" and self.bridging_mode == "stock")
         self._fil_cache: dict[str, dict] = {}
@@ -412,6 +432,6 @@ class Composer:
             "legacy_default": self.legacy, "fit": {"contour": self.fit[0], "hole": self.fit[1]},
             "supports": self.supports_mode, "bridging": self.bridging_mode,
             "ceilings": self.ceilings_mode,
-            "set": self.sets, "filaments": self.filament_specs,
+            "set": self.sets, "support_set": self.support_set, "filaments": self.filament_specs,
             "bambu_version": None if self.legacy else bp.app_version(self.app),
         }

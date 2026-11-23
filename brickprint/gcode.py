@@ -10,7 +10,6 @@ slicer's intent, not a caliper reading).
 from __future__ import annotations
 
 import math
-import re
 
 import numpy as np
 

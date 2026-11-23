@@ -45,6 +45,8 @@ stay empty). brickprint then auto-detects them at run time (for example
 skill for that `ldraw_library/ldraw` layout). You can also run
 `bin/brickprint` straight from the clone without installing.
 
+For development, `pip install -e ".[dev]"` installs a `brickprint` console script plus pytest and ruff; it must stay an editable/source-checkout install, because the bundled `assets/` live outside the package directory and a regular (non-editable) wheel would not contain them.
+
 Then check the setup and fix what is missing:
 
 ```bash
@@ -184,8 +186,9 @@ brickprint/
   agents/openai.yaml
   bin/brickprint           launcher
   brickprint/
-    cli.py                 subcommands
-    config.py              paths, doctor
+    cli.py                 argument parsing, subcommand dispatch
+    pipeline.py            build / verify / calibrate orchestration
+    config.py              paths, printer presets (--preset), doctor
     rebrickable.py         CSV download + inventory
     ldraw.py               LDraw resolution + LDView mesh cache
     pack.py                MaxRects packing

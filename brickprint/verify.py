@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import subprocess
 import tempfile
@@ -36,7 +35,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import features, gcode, orient
+from . import features, gcode
 from .settings import norm
 
 NS = {"c": "http://schemas.microsoft.com/3dmanufacturing/core/2015/02"}
