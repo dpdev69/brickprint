@@ -377,10 +377,13 @@ def test_threemf_validate_project_row_vector_rotation(tmp_path):
 
 
 def test_threemf_write_project_caches_mesh_and_keeps_blockers_in_verdict(tmp_path):
-    from brickprint import config
+    from brickprint import config, settings
     cfg = config.load_config()
     cfg["_composer"] = None
     cfg["support_set"] = ["support_top_z_distance=0.4"]  # non-legacy -> blockers enabled
+    comp = settings.Composer(cfg)
+    assert not comp.legacy
+    cfg["_composer"] = comp
     V, T = _make_hollow_brick(w=16.0, d=16.0, wall=1.6, ceil_z=3.0, top_z=5.0)
     meshes = {"b.dat": {"V": V.astype(np.float32), "T": T.astype(np.int32)}}
     plates = [
@@ -392,7 +395,9 @@ def test_threemf_write_project_caches_mesh_and_keeps_blockers_in_verdict(tmp_pat
          "items": [("b.dat", 10.0, 10.0, 16.0, 16.0)], "bbox": (26.0, 26.0)},
     ]
     out_v = tmp_path / "verdict.3mf"
-    with mock.patch.object(threemf, "_mesh_body", wraps=threemf._mesh_body) as spy:
+    # Stub Composer.compose so the test does not require Bambu Studio installed on CI
+    with mock.patch.object(comp, "compose", return_value={"enable_support": "0", "enable_prime_tower": "0"}), \
+         mock.patch.object(threemf, "_mesh_body", wraps=threemf._mesh_body) as spy:
         threemf.write_project(cfg, {"set_num": "test", "name": "test"}, plates, meshes, out_v, verdict=True)
         # 1 part mesh + 1 blocker mesh formatted ONCE across 2 plates (2 calls, not 4)
         assert spy.call_count == 2
