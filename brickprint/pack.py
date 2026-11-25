@@ -131,6 +131,16 @@ TOWER_KEEPOUT = (50.0, 50.0)
 TOWER_INSET = 4.0
 
 
+def _inst_pad(inst: dict) -> float:
+    """Per-side keep-out (mm) for an instance: max of explicit ``pad`` and any
+    outer brim extent (``brim_width`` + ``brim_object_gap``)."""
+    pad = float(inst.get("pad") or 0.0)
+    brim = float(inst.get("brim_width") or 0.0)
+    if brim > 0.0:
+        brim += float(inst.get("brim_object_gap") or 0.0)
+    return max(pad, brim)
+
+
 def pack(
     instances: list[dict],
     colors: dict[str, dict],
@@ -186,19 +196,20 @@ def pack(
     plates = []
     oversized = []
 
-    def size_key(i):
-        return (i["size"][0] * i["size"][1], i["size"][0], i["part_file"])
-
     def inflated(inst):
         w, d, _ = inst["size"]
-        pad = float(inst.get("pad") or 0.0)   # keep-out each side (own-object supports)
+        pad = _inst_pad(inst)   # keep-out each side (own-object supports / brims)
         return w + 2 * pad + gap, d + 2 * pad + gap
+
+    def size_key(i):
+        iw, ih = inflated(i)
+        return (iw * ih, iw, i["part_file"])
 
     def pack_list(color_id, insts):
         bins: list[Bin] = []
         for inst in sorted(insts, key=size_key, reverse=True):
             w, d, _ = inst["size"]
-            pad = float(inst.get("pad") or 0.0)   # keep-out each side (own-object supports)
+            pad = _inst_pad(inst)   # keep-out each side (own-object supports / brims)
             if w > usable_w + 1e-9 or d > usable_h + 1e-9:
                 oversized.append({
                     "part_file": inst["part_file"],
@@ -362,7 +373,7 @@ def pack(
         ok = True
         for inst in sorted(rem_sup, key=size_key, reverse=True):
             w, d, _ = inst["size"]
-            pad = float(inst.get("pad") or 0.0)
+            pad = _inst_pad(inst)
             pos = target.insert(w + 2 * pad + gap, d + 2 * pad + gap, inst["part_file"])
             if pos is None:
                 ok = False
@@ -412,7 +423,7 @@ def pack(
                 items = []
                 for inst, x, y in layout:
                     w, d, _ = inst["size"]
-                    pad = float(inst.get("pad") or 0.0)
+                    pad = _inst_pad(inst)
                     items.append((inst["part_file"], x + pad, y + pad, w, d))
                 cgroups.append({"color_id": color_id, "color_name": info["name"],
                                 "rgb": info["rgb"], "is_trans": info["is_trans"], "items": items})
