@@ -1,278 +1,87 @@
 # brickprint
 
-Turn a LEGO set number (or local MOC BOM CSV) into a color-grouped, multi-plate
-Bambu Studio project.
+[![CI](https://github.com/dpdev69/brickprint/actions/workflows/ci.yml/badge.svg)](https://github.com/dpdev69/brickprint/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-3776AB.svg)](pyproject.toml)
 
-This skill was built and validated on LEGO **10337-1 Lamborghini Countach**:
-1,506 parts, 387 Rebrickable lots, 19 colors, **about 33-36 A1-mini plates**
-(depending on support plates and packing), all of which slice. It has also been
-exercised on smaller sets (e.g. 30314-1 Go-Kart Racer) and tuned for LEGO clutch
-fit in PETG (`a1mini-petg-008-lego-v8`).
+Turn a LEGO set number or local MOC BOM CSV into a color-grouped, multi-plate Bambu Studio `.3mf` — oriented, bed-packed, fit-tuned, and slice-verified from the command line.
+
+## Features
+
+- **Inventory & exact meshes** — resolves set parts from Rebrickable CSV dumps (no API key) or a local BOM CSV and exports exact-millimetre LDraw geometry via LDView.
+- **Automated orientation & supports** — evaluates 24 axis-aligned poses, separates parts that need support onto dedicated plates, and keeps underside stud sockets clear with blockers and enforcers.
+- **Color-grouped bed packing** — packs parts with MaxRects for **A1 mini**, **A1**, **P1S**, and **X1C** presets (`--mix-colours` stays within Bambu's 36-plate grid).
+- **Clutch-fit & PETG tuning** — bundles calibrated 0.08 mm PETG process/filament profiles, per-object X-Y calibration (`calibrate fit`), small-contact/slender brims, and anchored socket ceilings.
+- **Headless verification** — slices via the Bambu Studio CLI to verify effective settings, stud/socket dimensions, supports, and floating regions (works while Bambu's GUI is open).
+
+## Quick Start
+
+```bash
+git clone https://github.com/dpdev69/brickprint.git
+cd brickprint
+./install.sh
+
+bin/brickprint doctor      # verify Python/numpy, LDraw, LDView, and Bambu Studio
+bin/brickprint bootstrap   # download Rebrickable CSVs and the LDraw library
+bin/brickprint build 10337-1 --bambu --verify
+```
+
+`./install.sh` installs the agent skill for **Antigravity**, **Claude Code**, and **Codex** (use `./install.sh --link` for development, or `pip install -e ".[dev]"` for a `brickprint` console script).
+
+## Common Commands
+
+```bash
+# Inspect a set inventory (parts, colors, missing LDraw geometry)
+bin/brickprint inventory 10337-1
+
+# Stock PLA build for A1 mini (default) or 256 mm printers (a1, p1s, x1c)
+bin/brickprint build 10337-1 --bambu --verify
+bin/brickprint build 10337-1 --preset x1c --bambu --verify
+
+# Build from a local MOC BOM CSV
+bin/brickprint build --bom my_moc.csv --name "My MOC" --bambu --verify
+
+# Calibrate and build tuned 0.08 mm PETG with LEGO clutch fit (A1 mini)
+bin/brickprint calibrate fit --profile a1mini-petg-008-lego-v8 \
+  --filament porima-petg-white --out fit_cal.3mf --bambu --verify
+bin/brickprint build 10337-1 --profile a1mini-petg-008-lego-v8 \
+  --filament White=porima-petg-white --fit 0.03 --fit-test --bambu --verify
+
+# Validate bounding boxes or run full CLI slice verification on any .3mf
+bin/brickprint validate *_parts_by_color.3mf
+bin/brickprint verify *_parts_by_color.3mf
+```
+
+## Outputs
+
+Each `build` writes a ready-to-slice Bambu Studio project plus companion diagnostics:
+
+- `*_parts_by_color.3mf` — color-grouped multi-plate project (normalised with plate thumbnails when `--bambu` is passed)
+- `*_plates.csv` — per-plate color, part count, bed footprint, max Z, filament, and support flag
+- `*_report.json` & `*_missing.csv` — completeness summary, orientation warnings, and any parts lacking LDraw geometry
 
 ## Requirements
 
-- **macOS or Linux.** macOS is the primary target (`/Applications/BambuStudio.app`,
-  `/Applications/LDView.app`, `~/Library/Caches/brickprint`). Linux paths
-  (`${XDG_CACHE_HOME:-~/.cache}/brickprint`, `LDView`/`bambu-studio` on `PATH`
-  or standard prefixes) are supported and CI-tested on Ubuntu; custom paths can
-  be set via config or environment variables.
-- **Bambu Studio**, installed. Its command-line interface is used for the
-  slicing checks (floating-part probe, final-geometry check, plate check,
-  `--bambu` normalisation, `verify`) and for non-A1-mini `--preset` templates.
-  Without it an A1 mini build still runs using the numpy emulator only, printing
-  a warning that floating detection is unverified.
-- **LDView** and an **LDraw parts library**. Neither is bundled; see
-  [Data sources and attribution](#data-sources-and-attribution). `brickprint
-  bootstrap` can download the LDraw library; LDView you install yourself.
-- **Python 3.9+ with numpy.** The launcher checks `$BRICKPRINT_PYTHON`, a local
-  `.venv`, Blender's bundled Python, and finally `python3`. See
-  [Which Python runs it](#which-python-runs-it).
+- **macOS or Linux** — macOS is the primary target; Linux paths are supported and CI-tested.
+- **Python 3.9+ with `numpy`** — the launcher checks `$BRICKPRINT_PYTHON`, a local `.venv`, Blender's bundled Python, then `python3`.
+- **LDView & LDraw parts library** — `bootstrap` downloads LDraw; install LDView separately.
+- **Bambu Studio** — required for `--bambu`, `--verify`, floating checks, and non-A1-mini `--preset` templates (optional for raw A1 mini builds).
 
-## Install
+Custom tool paths and defaults can be set in `~/.config/brickprint/config.json` or via `BRICKPRINT_LDRAW`, `BRICKPRINT_LDVIEW`, `BRICKPRINT_BAMBU`, and `BRICKPRINT_PRESET`.
 
-From a clone of this repository:
+## Documentation
 
-```bash
-./install.sh          # copy the skill into Antigravity, Codex, and Claude Code skill dirs
-./install.sh --link   # symlink instead of copying (development)
-```
+- [SKILL.md](SKILL.md) — agent skill instructions, CLI reference, and print-safety rules
+- [references/pipeline.md](references/pipeline.md) — inventory, LDraw resolution, orientation, probing, and MaxRects packing
+- [references/print-tuning.md](references/print-tuning.md) — PETG profiles, clutch-fit calibration, supports, bridging, and socket ceilings
+- [references/bambu-3mf.md](references/bambu-3mf.md) — 3MF plate layout, XML metadata, and CLI normalisation
+- [references/data-sources.md](references/data-sources.md) — Rebrickable, LDraw, LDView, and Bambu Studio sources
+- [references/troubleshooting.md](references/troubleshooting.md) — `doctor` diagnostics, Python/numpy setup, disk sweep, and common slicer warnings
 
-Targets installed:
+## License & Attribution
 
-- `~/.gemini/config/skills/brickprint` (Antigravity)
-- `~/.codex/skills/brickprint` (Codex)
-- `~/.claude/skills/brickprint` (Claude Code)
+- Code, tests, and documentation: [MIT License](LICENSE).
+- `assets/a1mini_pla_project_settings.json` (resolved from Bambu Studio stock presets): [GNU AGPL v3.0](LICENSES/AGPL-3.0.txt).
+- Full third-party attributions (Rebrickable CSV dumps, CC BY 4.0 LDraw library, Porima filament data, Bambu Studio): [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-The installer backs up any existing copy under `~/Library/Caches/brickprint/backups`
-(pruning older `brickprint.*` backups beyond `--keep-backups`, default 6) and
-writes `~/.config/brickprint/config.json` if it does not exist yet (an existing
-config is kept). The config holds `cache_dir`, `ldraw_dir`, `ldview`, and
-`bambu`, populated by checking environment overrides, ancestor workspace folders
-(`ldraw_library/ldraw`, `tools/LDView.app`), standard macOS/Linux install paths,
-and `PATH` (fields left empty are auto-detected at run time). You can also run
-`bin/brickprint` straight from the clone without installing, or symlink
-`bin/brickprint` onto your `PATH`.
-
-For development, `pip install -e ".[dev]"` installs a `brickprint` console script
-plus pytest and ruff; it must stay an editable/source-checkout install, because
-the bundled `assets/` live outside the package directory and a regular
-(non-editable) wheel would not contain them.
-
-Then check the setup and fix what is missing:
-
-```bash
-bin/brickprint doctor      # from the clone; shows resolved paths, Python/numpy, errors
-bin/brickprint bootstrap   # downloads the Rebrickable CSV dumps and, if no LDraw library is configured, the LDraw library
-```
-
-`bootstrap` does not install LDView or Bambu Studio: install those yourself and
-run `doctor` again. To point brickprint at things in other places, edit
-`~/.config/brickprint/config.json` (keys `ldraw_dir`, `ldview`, `bambu`,
-`cache_dir`, `preset`) or set environment variables, which take precedence over
-the config:
-
-```bash
-export BRICKPRINT_LDRAW=/path/to/ldraw          # folder with LDConfig.ldr, parts/, p/
-export BRICKPRINT_LDVIEW=/path/to/LDView        # the executable, e.g. .../LDView.app/Contents/MacOS/LDView
-export BRICKPRINT_BAMBU=/path/to/BambuStudio    # e.g. .../BambuStudio.app/Contents/MacOS/BambuStudio
-```
-
-## Use
-
-```bash
-brickprint doctor     # or bin/brickprint ... from a clone
-brickprint inventory 10337-1
-brickprint build 10337-1 --bambu --verify
-brickprint build 10337-1 --preset x1c --bambu --verify   # 256 mm printer (a1, p1s, x1c)
-brickprint validate *_parts_by_color.3mf
-brickprint verify *_parts_by_color.3mf
-
-# LEGO-clutch PETG (A1 mini)
-brickprint calibrate fit --profile a1mini-petg-008-lego-v8 --filament porima-petg-white --out fit_cal.3mf --bambu --verify
-brickprint build SET --profile a1mini-petg-008-lego-v8 --filament porima-petg-white --fit 0.03 --fit-test --bambu --verify
-```
-
-If the skill is installed (`brickprint` is not put on your `PATH`; call the
-launcher by path or symlink it into `~/.local/bin/brickprint`):
-
-```bash
-~/.gemini/config/skills/brickprint/bin/brickprint doctor   # Antigravity
-~/.claude/skills/brickprint/bin/brickprint doctor          # Claude Code
-~/.codex/skills/brickprint/bin/brickprint doctor           # Codex
-```
-
-### Which Python runs it
-
-brickprint needs Python 3.9+ **with numpy**. `bin/brickprint` picks, in order:
-
-1. `$BRICKPRINT_PYTHON`, if set;
-2. a local `.venv/bin/python` (or `.venv/bin/python3`) inside the skill root;
-3. the newest Blender bundled Python under
-   `/Applications/Blender.app/Contents/Resources/*/python/bin/python3*`;
-4. plain `python3`.
-
-The Blender interpreter is used as a convenience on macOS because it ships
-numpy, while system/Homebrew `python3` often has none. If no Blender or venv is
-present and `python3` lacks numpy, every command stops with
-`ERROR: numpy is not importable by this Python`. Fix it with
-`export BRICKPRINT_PYTHON=/path/to/python-with-numpy` (for example a venv with
-`pip install numpy`). `brickprint doctor` prints the interpreter in use
-(`python bin`) and the numpy version. You can also run the package directly:
-
-```bash
-PYTHONPATH=. /Applications/Blender.app/Contents/Resources/5.2/python/bin/python3.13 -m brickprint doctor
-```
-
-### Disk use of work dirs
-
-`verify` keeps its G-code in a `brickprint_verify_*` temp dir (the path is in
-the report; often 0.1-2.6 GB each), and an interrupted probe / plate check used
-to leave `probe_*` / `platecheck_*` / `final_*` dirs in the cache. `build`,
-`calibrate`, and `verify` sweep these at start: dirs older than `sweep_days`
-(config, default 3) go, then the oldest `brickprint_verify_*` dirs until they
-total at most `verify_keep_gb` (default 2). A dir with anything modified in the
-last hour is never touched (concurrent builds), nor a `--workdir` you passed.
-One line reports what was freed. Set `BRICKPRINT_NO_SWEEP=1` to turn it off.
-
-## What it generates
-
-- `<set>_<name>_parts_by_color.3mf` — Bambu Studio project (one object per plate
-  on stock PLA; one object per part with `ceilings recipe8`; one object per
-  colour group on mixed plates), one extruder per color, plate names
-  `"<color> i of n"`.
-- `<set>_<name>_parts_by_color_plates.csv` — per-plate color, part count, size,
-  max Z, filament, support flag.
-- `<set>_<name>_parts_by_color_missing.csv` — lots with no LDraw geometry.
-- `<set>_<name>_parts_by_color_report.json` — completeness and validation.
-- `<set>_<name>_parts_by_color_quality.csv` — per-part mesh quality report (profile builds).
-
-The raw project (`_raw.3mf`) is written first. If Bambu Studio is installed,
-`--bambu` re-exports it to add plate thumbnails and Bambu's normalised metadata.
-This works with the Bambu Studio GUI open. Without `--bambu` (the default), the
-raw file is copied as the output; it is still a valid 3MF expected to open in
-Bambu Studio (confirm with the manual GUI check in `references/print-tuning.md`).
-
-## Pipeline
-
-1. **Rebrickable** — the public CSV dumps provide the set inventory, part names,
-   color names/RGB, spares, minifigs, and part relationships. No API key.
-2. **LDraw** — each Rebrickable part number resolves to a `.dat` file (exact,
-   print-stripped, parent relationship, or mold variant). Each part is exported
-   with LDView using `-Seams=0`, so dimensions are exact LDraw millimetres.
-3. **Orientation** — each part is evaluated in 24 axis-aligned poses. The
-   assembled (studs-up) pose is kept unless it has floating/empty slicer layers
-   or stands on an edge. Parts that still need support are put on separate
-   `<Color> supports i of n` plates with tree supports enabled only there.
-4. **Packing** — parts are grouped by color and packed with MaxRects into the
-   selected printer preset's bed (`a1mini`: 180×180 mm; `a1`/`p1s`/`x1c`:
-   256×256 mm, with the 18×28 mm front-left exclusion zone respected on P1S/X1C;
-   default 6 mm margin, 1 mm gap). `--mix-colours auto` (default) merges tiny
-   colour groups onto shared plates (≤4 colours/plate) only when needed to stay
-   within 36 plates; `--mix-colours always|off` overrides it.
-5. **3MF** — one model file per plate, globally unique object IDs, one component
-   per part. Build items sit on Bambu's plate grid (`stride = bed × 1.2`,
-   `cols = ceil(sqrt(plate_count))`, rows toward negative Y), which is what makes
-   Bambu assign the right geometry to the right plate.
-6. **Print tuning** — optional profiles (`--profile`, `--filament`, `--fit`,
-   `--supports enforcers`, `--bridging short-span`, `--ceilings recipe8`); see
-   `references/print-tuning.md`.
-7. **Bambu normalisation** — optional CLI `--export-3mf` pass (`--bambu`) for
-   thumbnails and project metadata.
-8. **verify** — slice with the CLI and check effective settings, stud/socket
-   toolpaths, supports and floating.
-
-See `references/pipeline.md` for details.
-
-## Known limitations
-
-- LDraw coverage is not universal. Missing parts are reported, not invented.
-- Printed parts are simplified to the base mold when possible.
-- Minifigs are not expanded unless `--include-minifigs`; leg/torso assemblies
-  often have no LDraw equivalent.
-- Parts larger than the usable bed are skipped and reported. Use `--preset x1c`
-  (or larger `--bed/--depth`) or split the project.
-- One color per plate is the default whenever a set fits within 36 plates; pass
-  `--mix-colours always` to combine tiny colour groups (≤35% full, ≤4 colours
-  per plate).
-- Tuned PETG / LEGO-fit profiles (`a1mini-petg-*`) and Porima filament profiles
-  are calibrated for the A1 mini only; `--preset a1|p1s|x1c` use Bambu's stock
-  0.20 mm PLA preset chain.
-- LDraw footprints are 8·n mm (real LEGO 8·n − 0.2), and contour compensation
-  grows them further. Neighbouring bricks can rub; `verify` reports the
-  outer sizes. Mesh-level footprint relief is deliberately not implemented.
-- Do not use mesh repair tools that fill all holes: LEGO undersides are open by
-  design and filling them blocks the stud cavities.
-
-## Layout
-
-```
-brickprint/
-  SKILL.md                 agent instructions
-  README.md
-  LICENSE, LICENSES/, THIRD_PARTY_NOTICES.md
-  pyproject.toml
-  install.sh
-  agents/openai.yaml
-  bin/brickprint           launcher
-  brickprint/
-    __main__.py            `python -m brickprint` entrypoint + numpy guard
-    cli.py                 argument parsing, subcommand dispatch
-    pipeline.py            build / verify / calibrate orchestration
-    config.py              paths, printer presets (--preset), doctor
-    rebrickable.py         CSV download + inventory
-    ldraw.py               LDraw resolution + LDView mesh cache
-    pack.py                MaxRects packing + --mix-colours
-    threemf.py             3MF writer + validator
-    settings.py            print profiles -> Bambu project settings
-    bambu_profiles.py      Bambu stock preset chain resolution
-    features.py            enforcer volumes, socket blockers, bridge angles, stud rings
-    ceilings.py            socket-ceiling recipe8 (raise, bands, ribs)
-    quality.py             per-part mesh quality report
-    gcode.py               G-code config/toolpath reader
-    verify.py              slice + check effective settings and fit
-    probe.py, orient.py, repair.py   floating probe, orientation, mesh repair
-    slice_cache.py         shared per-plate content-addressed G-code cache
-    sweep.py               work-dir disk cleanup
-    net.py                 urllib/curl/wget download helper
-  assets/
-    a1mini_pla_project_settings.json   default profile snapshot
-    profiles/process/*.json            process profiles
-    profiles/filament/*.json           filament (spool) profiles
-  references/
-  tests/
-```
-
-## Data sources and attribution
-
-The first three items are fetched or installed at run time and are not in this
-repository; the last two are bundled. Details are in
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
-
-- **Rebrickable inventories** (set parts, colours, relationships) are the public
-  CSV dumps from <https://rebrickable.com/downloads/>, downloaded on first use
-  (`bootstrap`, `inventory` or `build`). No API key. Respect Rebrickable's terms;
-  attribution is required for public use.
-- **LDraw parts library** (<https://library.ldraw.org/>) is downloaded by
-  `brickprint bootstrap` (or you point brickprint at your own copy). The library
-  is CC BY 4.0; keep its `CAreadme.txt` and attribution files with it.
-- **LDView** is installed separately and used for mesh export.
-- **Filament profiles** under `assets/profiles/filament/` use the temperature,
-  fan and drying ranges published by Porima; each JSON file carries the product
-  URL and retrieval date. The flow values are the author's own tuning.
-- **Default profile** `assets/a1mini_pla_project_settings.json` is a snapshot of
-  Bambu Studio's stock A1 mini presets (Bambu Studio 02.09.01.70), derived from
-  the Bambu Studio repository (<https://github.com/bambulab/BambuStudio>,
-  AGPL-3.0).
-
-brickprint is not affiliated with or endorsed by the LEGO Group, Rebrickable,
-LDraw.org, Bambu Lab or Porima. LEGO is a trademark of the LEGO Group.
-
-## License
-
-brickprint's code, tests and documentation are released under the
-[MIT License](LICENSE).
-
-One bundled file is not MIT: `assets/a1mini_pla_project_settings.json` is
-derived from Bambu Studio's stock presets and is licensed under the
-[GNU AGPL v3.0](LICENSES/AGPL-3.0.txt). See
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+*brickprint is not affiliated with or endorsed by the LEGO Group, Rebrickable, LDraw.org, Bambu Lab, or Porima. LEGO is a trademark of the LEGO Group.*
