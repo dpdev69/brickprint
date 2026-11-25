@@ -250,6 +250,101 @@ def models_sha(path: Path) -> str:
 # slicing
 # ---------------------------------------------------------------------------
 
+def _norm_warning(msg: str) -> str:
+    return " ".join(ln.strip() for ln in str(msg).splitlines() if ln.strip())
+
+
+def _merge_warning(bucket: list[str], msg: str) -> None:
+    """Append ``msg`` to ``bucket``, deduplicating and letting a fuller
+    message (e.g. from ``result.json``) replace a truncated prefix."""
+    clean = _norm_warning(msg)
+    if not clean:
+        return
+    for i, existing in enumerate(bucket):
+        if clean == existing or existing.startswith(clean):
+            return
+        if clean.startswith(existing):
+            bucket[i] = clean
+            return
+    bucket.append(clean)
+
+
+def _read_result_warnings(outdir: Path, plate_id_override: int | None = None) -> dict[int, list[str]]:
+    """Read per-plate ``warning_message`` strings emitted by Bambu Studio CLI
+    into ``result.json`` (``sliced_plates[*].warning_message``) and any
+    ``plate_*.json`` sidecars under ``outdir``."""
+    out: dict[int, list[str]] = defaultdict(list)
+    res_path = outdir / "result.json"
+    if res_path.is_file():
+        try:
+            data = json.loads(res_path.read_text(errors="replace"))
+        except (OSError, ValueError):
+            data = None
+        if isinstance(data, dict):
+            for idx, sp in enumerate(data.get("sliced_plates") or [], 1):
+                if not isinstance(sp, dict):
+                    continue
+                wm = _norm_warning(sp.get("warning_message") or "")
+                if not wm:
+                    continue
+                pid = sp.get("id")
+                if pid is None:
+                    pid = plate_id_override if plate_id_override else idx
+                try:
+                    _merge_warning(out[int(pid)], wm)
+                except (TypeError, ValueError):
+                    pass
+    for pj in sorted(outdir.glob("plate_*.json")):
+        m = re.match(r"plate_(\d+)\.json$", pj.name)
+        if not m:
+            continue
+        pid = int(m.group(1))
+        try:
+            pdata = json.loads(pj.read_text(errors="replace"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(pdata, dict):
+            wm = _norm_warning(pdata.get("warning_message") or "")
+            if wm:
+                _merge_warning(out[pid], wm)
+    return dict(out)
+
+
+def _extract_plate_warnings(
+    text: str,
+    outdir: Path | None = None,
+    plate_id_override: int | None = None,
+) -> dict[int, list[str]]:
+    """Extract per-plate Bambu Studio warnings from CLI log text (including
+    unprefixed continuation lines of multi-line warnings) and optionally
+    ``result.json`` / ``plate_*.json`` under ``outdir``."""
+    out: dict[int, list[str]] = defaultdict(list)
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        m = _WARN_RE.search(lines[i])
+        if not m:
+            i += 1
+            continue
+        pid = int(m.group(1))
+        parts = [m.group(2).strip()]
+        j = i + 1
+        while j < len(lines):
+            nxt = lines[j].strip()
+            if not nxt or nxt.startswith("[") or nxt.startswith("plate ") \
+                    or nxt.startswith("run ") or _WARN_RE.search(lines[j]):
+                break
+            parts.append(nxt)
+            j += 1
+        _merge_warning(out[pid], " ".join(p for p in parts if p))
+        i = j
+    if outdir is not None:
+        for pid, msgs in _read_result_warnings(outdir, plate_id_override=plate_id_override).items():
+            for msg in msgs:
+                _merge_warning(out[pid], msg)
+    return dict(out)
+
+
 def slice_project(bambu: str, src: Path, outdir: Path, plate: int = 0, timeout: int = 3600) -> tuple[int, str]:
     outdir.mkdir(parents=True, exist_ok=True)
     cmd = [bambu, "--slice", str(plate), "--arrange", "0", "--orient", "0", "--debug", "2",
@@ -260,7 +355,21 @@ def slice_project(bambu: str, src: Path, outdir: Path, plate: int = 0, timeout: 
             rc = subprocess.run(cmd, stdout=lf, stderr=subprocess.STDOUT, timeout=timeout).returncode
     except subprocess.TimeoutExpired:
         rc = -1
-    return rc, log.read_text(errors="replace")
+    text = log.read_text(errors="replace")
+    # Merge any result.json / plate_*.json warning_message entries (which may
+    # hold fuller text than the log line) into normalized log-format lines so
+    # callers, batch retries, and slice_cache all carry them transparently.
+    log_warns = _extract_plate_warnings(text)
+    extra_lines = []
+    for pid, msgs in sorted(_read_result_warnings(outdir, plate_id_override=plate if plate > 0 else None).items()):
+        existing = log_warns.get(pid, [])
+        for msg in msgs:
+            if not any(msg == e or e.startswith(msg) for e in existing):
+                extra_lines.append(f"plate {pid}: found slicing warnings: {msg}")
+    if extra_lines:
+        sep = "" if (not text or text.endswith("\n")) else "\n"
+        text = text + sep + "\n".join(extra_lines) + "\n"
+    return rc, text
 
 
 def _slice_error(text: str, rc: int, log_path: Path) -> str:
@@ -970,11 +1079,7 @@ def _slice_with_cache(
         new_g, text_remapped, failed = slice_plates(bambu, proj_path, outdir, ids, log=log)
 
     # Extract per-plate warnings and populate the shared cache for clean plates
-    warns_by_pid: dict[int, list[str]] = defaultdict(list)
-    for m in _WARN_RE.finditer(text_remapped):
-        pid, msg = int(m.group(1)), m.group(2).strip()
-        if msg and msg not in warns_by_pid[pid]:
-            warns_by_pid[pid].append(msg)
+    warns_by_pid = _extract_plate_warnings(text_remapped)
 
     for pid, gpath in new_g.items():
         g[pid] = gpath
@@ -1124,6 +1229,22 @@ def _run_checks(path, bambu, proj, ids, reference, ref_proj, rids, tol, work, fl
         warnings.extend(p_warns)
         if rec is not None:
             result["plates"][pid] = rec
+
+    # Surface Bambu Studio slicer warnings from the actual project slice (e.g.
+    # "Unsupported overhangs were detected...").  When float_check is enabled,
+    # floating / empty-layer warnings are owned by the supports-off check below.
+    for pid, msgs in sorted(_extract_plate_warnings(text).items()):
+        if pid not in ids:
+            continue
+        surfaced = []
+        for msg in msgs:
+            low = msg.lower()
+            if float_check and ("floating" in low or "empty layer" in low):
+                continue
+            warnings.append(f"plate {pid}: Bambu slicer warning: {msg}")
+            surfaced.append(msg)
+        if surfaced and pid in result["plates"]:
+            result["plates"][pid]["slicer_warnings"] = surfaced
 
     if float_check:
         if off_same:

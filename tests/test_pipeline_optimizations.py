@@ -147,7 +147,7 @@ def _make_valid_3mf(
                 f'<range min_z="{lo:g}" max_z="{hi:g}"><option opt_key="layer_height">0.24</option></range>'
                 for lo, hi in layer_ranges[pi]
             )
-            lcr_xmls.append(f'<object id="{oid}">{rngs}</object>')
+            lcr_xmls.append(f'<object id="{pi}">{rngs}</object>')
         fseq[f"plate_{pi}"] = {"sequence": []}
 
     model_xml = (

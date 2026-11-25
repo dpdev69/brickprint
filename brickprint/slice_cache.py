@@ -305,10 +305,12 @@ def plate_keys(
 
         model_root = ET.fromstring(z.read("3D/3dmodel.model"))
         build_items: dict[str, list[float]] = {}
-        for it in model_root.findall("c:build/c:item", _NS):
+        build_seq: dict[str, str] = {}
+        for seq_idx, it in enumerate(model_root.findall("c:build/c:item", _NS), 1):
             oid = it.get("objectid")
             if oid:
                 build_items[oid] = _parse_transform(it.get("transform"))
+                build_seq[oid] = str(seq_idx)
 
         res_comps: dict[str, list[tuple[str, str, list[float]]]] = {}
         inline_hashes: dict[str, str] = {}
@@ -382,7 +384,7 @@ def plate_keys(
                     "imeta": imeta,
                     "item_tr": item_tr,
                     "obj": obj_settings.get(oid, {"meta": [], "parts": []}),
-                    "ranges": layer_ranges.get(oid, []),
+                    "ranges": layer_ranges.get(build_seq.get(oid, ""), []),
                     "comps": comp_sig,
                 })
             # Canonical sort so instance serialization order doesn't defeat hits
@@ -705,12 +707,16 @@ def filter_plates_3mf(
                         if cpath:
                             kept_model_files.add(cpath)
         build = model_root.find("c:build", _NS)
+        seq_map: dict[str, str] = {}
         if build is not None:
-            for it in list(build.findall("c:item", _NS)):
+            new_seq = 0
+            for old_seq, it in enumerate(list(build.findall("c:item", _NS)), 1):
                 oid = it.get("objectid")
                 if oid not in kept_oids:
                     build.remove(it)
                 else:
+                    new_seq += 1
+                    seq_map[str(old_seq)] = str(new_seq)
                     dx, dy = oid_delta.get(oid, (0.0, 0.0))
                     if dx or dy:
                         tr = _parse_transform(it.get("transform"))
@@ -726,13 +732,18 @@ def filter_plates_3mf(
                 ps_out[wk] = [val[orig_pid - 1] if orig_pid - 1 < len(val) else val[0]
                               for orig_pid in keep_ordered]
 
-        # Filter Metadata/layer_config_ranges.xml if present
+        # Filter & remap Metadata/layer_config_ranges.xml (<object id> is the
+        # 1-based <build><item> sequence index in 3D/3dmodel.model, not the
+        # resource object ID).
         lcr_bytes: bytes | None = None
         if "Metadata/layer_config_ranges.xml" in names:
             lcr_root = ET.fromstring(zin.read("Metadata/layer_config_ranges.xml"))
             for obj in list(lcr_root.findall("object")):
-                if obj.get("id") not in kept_oids:
+                new_id = seq_map.get(obj.get("id") or "")
+                if new_id is None:
                     lcr_root.remove(obj)
+                else:
+                    obj.set("id", new_id)
             lcr_bytes = b'<?xml version="1.0" encoding="utf-8"?>\n' + ET.tostring(lcr_root, encoding="utf-8")
 
         # Filter Metadata/filament_sequence.json if present
@@ -753,6 +764,20 @@ def filter_plates_3mf(
         model_bytes = b'<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(model_root, encoding="utf-8")
         ps_bytes = json.dumps(ps_out, indent=1).encode("utf-8")
 
+        # Filter 3D/_rels/3dmodel.model.rels so dropped 3D/Objects/*.model files
+        # are not still referenced (otherwise Bambu Studio exits 250 with
+        # "File /3D/Objects/... not found from archive").
+        rels_bytes: bytes | None = None
+        if "3D/_rels/3dmodel.model.rels" in names:
+            rel_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+            ET.register_namespace("", rel_ns)
+            rels_root = ET.fromstring(zin.read("3D/_rels/3dmodel.model.rels"))
+            for rel in list(rels_root):
+                tgt = (rel.get("Target") or "").replace("//", "/").lstrip("/")
+                if tgt.startswith("3D/Objects/") and tgt.endswith(".model") and tgt not in kept_model_files:
+                    rels_root.remove(rel)
+            rels_bytes = b'<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(rels_root, encoding="utf-8")
+
         Path(dst).parent.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as zout:
             for info in zin.infolist():
@@ -767,6 +792,8 @@ def filter_plates_3mf(
                     continue
                 if fn == "3D/3dmodel.model":
                     zout.writestr(fn, model_bytes)
+                elif fn == "3D/_rels/3dmodel.model.rels" and rels_bytes is not None:
+                    zout.writestr(fn, rels_bytes)
                 elif fn == "Metadata/model_settings.config":
                     zout.writestr(fn, ms_bytes)
                 elif fn == "Metadata/project_settings.config":

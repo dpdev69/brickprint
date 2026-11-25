@@ -309,3 +309,52 @@ def test_plate_limit_folds_support_parts_into_last_normal_plate(capsys):
     assert {n for n, *_ in plates[0]["items"]} == {"n.dat", "s.dat"}
     assert "folded" in capsys.readouterr().out
     assert_plate_valid(plates[0])
+
+
+def test_brim_keepout_prevents_fused_brims_on_normal_mixed_and_folded_plates():
+    # Two 3 mm brimmed parts (brim_width=3.0, brim_object_gap=0.2 -> 3.2 mm per side)
+    # with pack gap=1.0 must sit >= 3.2 + 3.2 + 1.0 = 7.4 mm apart, and >= 3.2 mm from
+    # usable bed edges, while a brimmed + unbrimmed pair sits >= 3.2 + 1.0 = 4.2 mm apart.
+    brim_insts = [
+        inst("b1.dat", "1", 8.0, 8.0, count=6, pad=3.2),
+        inst("b2.dat", "1", 8.0, 8.0, count=4, brim_width=3.0, brim_object_gap=0.2),
+        inst("plain.dat", "1", 16.0, 16.0, count=2),
+    ]
+    plates, oversized, _ = run(brim_insts, gap=1.0)
+    assert oversized == [] and len(plates) == 1
+    pad_of = {"b1.dat": 3.2, "b2.dat": 3.2, "plain.dat": 0.0}
+    items = plates[0]["items"]
+    for name, x, y, w, d in items:
+        p = pad_of[name]
+        assert x >= p - EPS and y >= p - EPS
+        assert x + w <= USABLE_W - p - 1.0 + EPS
+        assert y + d <= USABLE_H - p - 1.0 + EPS
+    for a, b in itertools.combinations(items, 2):
+        na, ax, ay, aw, ad = a
+        nb, bx, by, bw, bd = b
+        sep = max(bx - (ax + aw), ax - (bx + bw), by - (ay + ad), ay - (by + bd))
+        assert sep >= pad_of[na] + pad_of[nb] + 1.0 - EPS, (a, b)
+
+    # Mixed plate with brimmed parts from two colours
+    mix_plates, ov_m, _ = run([
+        inst("m1.dat", "1", 8.0, 8.0, count=2, brim_width=3.0, brim_object_gap=0.2),
+        inst("m2.dat", "2", 8.0, 8.0, count=2, pad=3.2),
+    ], gap=1.0, mix="always")
+    assert ov_m == [] and len(mix_plates) == 1
+    for a, b in itertools.combinations(mix_plates[0]["items"], 2):
+        _, ax, ay, aw, ad = a
+        _, bx, by, bw, bd = b
+        sep = max(bx - (ax + aw), ax - (bx + bw), by - (ay + ad), ay - (by + bd))
+        assert sep >= 3.2 + 3.2 + 1.0 - EPS
+
+    # Folded plate where BOTH normal and support parts carry 3.2 mm brim pads
+    fold_plates, ov_f, _ = run([
+        inst("fn.dat", "1", 8.0, 8.0, count=2, pad=3.2),
+        inst("fs.dat", "1", 8.0, 8.0, count=2, needs_support=True, brim_width=3.0, brim_object_gap=0.2),
+    ], gap=1.0, max_plates=1, mix="off")
+    assert ov_f == [] and len(fold_plates) == 1 and fold_plates[0]["support"] == "folded"
+    for a, b in itertools.combinations(fold_plates[0]["items"], 2):
+        _, ax, ay, aw, ad = a
+        _, bx, by, bw, bd = b
+        sep = max(bx - (ax + aw), ax - (bx + bw), by - (ay + ad), ay - (by + bd))
+        assert sep >= 3.2 + 3.2 + 1.0 - EPS

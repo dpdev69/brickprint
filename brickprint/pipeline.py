@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import os
 import re
 import shutil
@@ -331,17 +332,68 @@ def _prepare_meshes(cfg, unique_files, overrides, use_probe: bool, cache=None, v
     return meshes, probe_report, bambu
 
 
+def _needs_brim(V: np.ndarray, T: np.ndarray, brim: dict) -> bool:
+    """True when a part should receive a per-object outer brim under the
+    profile's ``small-contact`` policy: tiny flat bed contact (< contact_mm2)
+    OR tall & slender (height >= slender_min_height_mm and H / eq_d >= slender_ratio).
+    Catches narrow tip-over parts (e.g. 44302a, 4460a, 30099, 4081b, 50967)
+    without adding brims to ordinary bricks and plates."""
+    if brim.get("mode") != "small-contact":
+        return False
+    V = np.asarray(V, dtype=float)
+    T = np.asarray(T, dtype=int)
+    if not len(V) or not len(T):
+        return False
+    tri = V[T]
+    flat = np.all(np.abs(tri[:, :, 2] - V[:, 2].min()) < 1e-3, axis=1)
+    e1, e2 = tri[flat, 1] - tri[flat, 0], tri[flat, 2] - tri[flat, 0]
+    area = float(np.abs(e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0]).sum() / 2)
+    if area < float(brim.get("contact_mm2", 20)):
+        return True
+    slender_lim = float(brim.get("slender_ratio", 2.5))
+    min_h = float(brim.get("slender_min_height_mm", 15.0))
+    height = float(V[:, 2].max() - V[:, 2].min())
+    if slender_lim > 0 and height >= min_h:
+        eq_d = 2.0 * math.sqrt(area / math.pi) if area > 0.0 else 0.0
+        if eq_d == 0.0 or height / eq_d >= slender_lim:
+            return True
+    return False
+
+
 def _object_pad(comp, m: dict) -> float:
-    """Keep-out (mm per side) around a part that is its own Bambu object and
-    carries a support enforcer: its support may not run into a neighbouring
-    object (Bambu rejects the plate with "gcode path conflicts")."""
-    if comp.ceilings_mode == "off" or m.get("enforcer") is None:
+    """Keep-out (mm per side) around a part for support enforcers and/or brims.
+
+    * Enforcers on separate objects: support may not run into a neighbouring
+      object (Bambu rejects the plate with "gcode path conflicts").
+    * Brims (per-object or explicit global outer brim): reserve at least
+      ``brim_width + brim_object_gap`` per side so neighbouring brims never
+      overlap and fuse into a solid brim mat.
+    """
+    if getattr(comp, "legacy", False):
         return 0.0
-    EV = np.asarray(m["enforcer"][0], dtype=float)
-    V = np.asarray(m["V"], dtype=float)
-    over = max(float((V[:, :2].min(axis=0) - EV[:, :2].min(axis=0)).max()),
-               float((EV[:, :2].max(axis=0) - V[:, :2].max(axis=0)).max()), 0.0)
-    return round(over + 3.0, 2)
+    pad = 0.0
+    if comp.ceilings_mode != "off" and m.get("enforcer") is not None:
+        EV = np.asarray(m["enforcer"][0], dtype=float)
+        V = np.asarray(m["V"], dtype=float)
+        over = max(float((V[:, :2].min(axis=0) - EV[:, :2].min(axis=0)).max()),
+                   float((EV[:, :2].max(axis=0) - V[:, :2].max(axis=0)).max()), 0.0)
+        pad = max(pad, round(over + 3.0, 2))
+    meta = m.get("object_meta") or {}
+    btype = meta.get("brim_type")
+    if btype and btype != "no_brim":
+        bw = float(meta.get("brim_width") or 0.0)
+        bg = float(meta.get("brim_object_gap") or 0.0)
+        if bw > 0.0:
+            pad = max(pad, round(bw + bg, 2))
+    elif not btype and hasattr(comp, "process_overrides"):
+        ov = comp.process_overrides()
+        gbtype = str(ov.get("brim_type") or "")
+        if gbtype and gbtype not in ("no_brim", "auto"):
+            bw = float(ov.get("brim_width") or 5.0)
+            bg = float(ov.get("brim_object_gap") or 0.1)
+            if bw > 0.0:
+                pad = max(pad, round(bw + bg, 2))
+    return pad
 
 
 def _apply_features(cfg, meshes) -> dict:
@@ -363,6 +415,7 @@ def _apply_features(cfg, meshes) -> dict:
                 above=float(sp.get("above_mm", 0.6)))
             if boxes:
                 m["enforcer"] = features.box_mesh(boxes)
+                m["enforcer_boxes"] = boxes
                 out["enforcers"][pf] = boxes
         if comp.bridging_mode == "short-span":
             ang = features.bridge_angle(m["V"], m["T"], int(br.get("x_long_angle", 90)))
@@ -396,17 +449,10 @@ def _apply_features(cfg, meshes) -> dict:
         pfit = prof.get("part_settings") or {}
         for pf, m in sorted(meshes.items()):
             meta = {}
-            if brim.get("mode") == "small-contact":
-                V = np.asarray(m["V"], dtype=float)
-                T = np.asarray(m["T"], dtype=int)
-                tri = V[T]
-                flat = np.all(np.abs(tri[:, :, 2] - V[:, 2].min()) < 1e-3, axis=1)
-                e1, e2 = tri[flat, 1] - tri[flat, 0], tri[flat, 2] - tri[flat, 0]
-                area = float(np.abs(e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0]).sum() / 2)
-                if area < float(brim.get("contact_mm2", 20)):
-                    meta.update({"brim_type": "outer_only",
-                                 "brim_width": f"{float(brim.get('width_mm', 3)):g}",
-                                 "brim_object_gap": f"{float(brim.get('gap_mm', 0.2)):g}"})
+            if _needs_brim(m["V"], m["T"], brim):
+                meta.update({"brim_type": "outer_only",
+                             "brim_width": f"{float(brim.get('width_mm', 3)):g}",
+                             "brim_object_gap": f"{float(brim.get('gap_mm', 0.2)):g}"})
             for k, v in (pfit.get(Path(pf).stem) or {}).items():
                 meta[k] = str(v)
             if meta:
@@ -736,17 +782,24 @@ def run_build(args):
     sx, sy = _exclusion_shift(cfg)
 
     def layout():
-        instances = [
-            {
+        instances = []
+        for m in merged:
+            mesh = meshes[m["part_file"]]
+            inst = {
                 "part_file": m["part_file"],
                 "color_id": m["color_id"],
-                "size": meshes[m["part_file"]]["size"],
+                "size": mesh["size"],
                 "count": m["quantity"],
-                "needs_support": meshes[m["part_file"]]["needs_support"],
-                "pad": _object_pad(comp, meshes[m["part_file"]]),
+                "needs_support": mesh["needs_support"],
+                "pad": _object_pad(comp, mesh),
             }
-            for m in merged
-        ]
+            ometa = mesh.get("object_meta") or {}
+            if ometa.get("brim_type") and ometa.get("brim_type") != "no_brim":
+                bw = float(ometa.get("brim_width") or 0.0)
+                if bw > 0.0:
+                    inst["brim_width"] = bw
+                    inst["brim_object_gap"] = float(ometa.get("brim_object_gap") or 0.0)
+            instances.append(inst)
         # a --fit-test plate is appended after packing: keep a grid slot free for it
         plates, oversized, _ = pack.pack(
             instances, colors,

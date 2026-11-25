@@ -54,10 +54,96 @@ def _hull_distance(P: np.ndarray, H: np.ndarray) -> np.ndarray:
     for i in range(len(H)):
         a, b = H[i], H[(i + 1) % len(H)]
         ab = b - a
-        t = np.clip(((P - a) @ ab) / max(float(ab @ ab), 1e-12), 0.0, 1.0)
+        t = np.clip(((P - a) * ab).sum(axis=1) / max(float(ab @ ab), 1e-12), 0.0, 1.0)
         diff = P - (a + t[:, None] * ab)
         d2 = np.minimum(d2, (diff * diff).sum(axis=1))
     return np.sqrt(d2)
+
+
+def _norm_boxes(items) -> list[list[float]]:
+    """Normalize a sequence of ``{"box": [...]}`` dicts or 6-element box coords."""
+    if not items:
+        return []
+    out = []
+    for it in items:
+        bx = it["box"] if isinstance(it, dict) else it
+        out.append([float(v) for v in bx])
+    return out
+
+
+def _subtract_box(a: list[float], b: list[float], eps: float = 1e-6) -> list[list[float]]:
+    """Return disjoint axis-aligned boxes covering ``a \\ b``."""
+    ax0, ax1, ay0, ay1, az0, az1 = a
+    bx0, bx1, by0, by1, bz0, bz1 = b
+    if (ax1 <= bx0 + eps or bx1 <= ax0 + eps
+            or ay1 <= by0 + eps or by1 <= ay0 + eps
+            or az1 <= bz0 + eps or bz1 <= az0 + eps):
+        return [a]
+    ix0, ix1 = max(ax0, bx0), min(ax1, bx1)
+    iy0, iy1 = max(ay0, by0), min(ay1, by1)
+    iz0, iz1 = max(az0, bz0), min(az1, bz1)
+    out = []
+    if az0 < iz0 - eps:
+        out.append([ax0, ax1, ay0, ay1, az0, iz0])
+    if iz1 < az1 - eps:
+        out.append([ax0, ax1, ay0, ay1, iz1, az1])
+    if ax0 < ix0 - eps:
+        out.append([ax0, ix0, ay0, ay1, iz0, iz1])
+    if ix1 < ax1 - eps:
+        out.append([ix1, ax1, ay0, ay1, iz0, iz1])
+    if ay0 < iy0 - eps:
+        out.append([ix0, ix1, ay0, iy0, iz0, iz1])
+    if iy1 < ay1 - eps:
+        out.append([ix0, ix1, iy1, ay1, iz0, iz1])
+    return out
+
+
+def subtract_boxes(
+    boxes: list[dict],
+    exclude,
+    min_area: float = 0.05,
+    min_dz: float = 1e-3,
+) -> list[dict]:
+    """Subtract ``exclude`` boxes from ``boxes``, dropping empty/tiny slivers."""
+    excl = _norm_boxes(exclude)
+    if not excl or not boxes:
+        return list(boxes)
+    out = []
+    for item in boxes:
+        bx = [float(v) for v in (item["box"] if isinstance(item, dict) else item)]
+        pieces = [bx]
+        for ex in excl:
+            pieces = [p2 for p in pieces for p2 in _subtract_box(p, ex)]
+            if not pieces:
+                break
+        extra = {k: v for k, v in item.items() if k != "box"} if isinstance(item, dict) else {}
+        for p in pieces:
+            if (p[1] - p[0]) * (p[3] - p[2]) >= min_area and (p[5] - p[4]) >= min_dz:
+                out.append({"box": [round(v, 3) for v in p], **extra})
+    return out
+
+
+def mesh_boxes(V, T) -> list[list[float]]:
+    """Recover per-box AABBs from a ``box_mesh`` ``(V, T)`` tuple."""
+    V = np.asarray(V, dtype=np.float64)
+    T = np.asarray(T, dtype=np.int64)
+    if len(V) == 0 or len(T) == 0:
+        return []
+    if len(V) % 8 == 0 and len(T) == (len(V) // 8) * 12:
+        out = []
+        for i in range(0, len(V), 8):
+            chunk = V[i:i + 8]
+            lo, hi = chunk.min(axis=0), chunk.max(axis=0)
+            out.append([float(lo[0]), float(hi[0]), float(lo[1]), float(hi[1]),
+                        float(lo[2]), float(hi[2])])
+        return out
+    out = []
+    for g in _clusters(T, np.arange(len(T))):
+        P = V[np.unique(T[g])]
+        lo, hi = P.min(axis=0), P.max(axis=0)
+        out.append([float(lo[0]), float(hi[0]), float(lo[1]), float(hi[1]),
+                    float(lo[2]), float(hi[2])])
+    return out
 
 
 def _clusters(T: np.ndarray, faces: np.ndarray) -> list[np.ndarray]:
@@ -87,7 +173,7 @@ def cantilever_boxes(V, T, protrusion: float = 0.8, margin: float = 0.2,
     H = footprint_hull(V)
     if len(H) < 3:
         return []
-    zmin0 = V[:, 2].min()
+    zmin0 = float(V[:, 2].min())
     down_idx = np.nonzero((nz < -1e-3) & (cen[:, 2] > zmin0 + MIN_Z))[0]
     if not len(down_idx):
         return []
@@ -98,11 +184,64 @@ def cantilever_boxes(V, T, protrusion: float = 0.8, margin: float = 0.2,
     cand, dist = cand[dist > OUTSIDE_MM], dist[dist > OUTSIDE_MM]
     if not len(cand):
         return []
+
+    # Exclude downward faces whose outward normal enters ANY 2D-enclosed cavity
+    # (roofed sockets on 41749/46413/50967/30099 OR open-top upside-down sockets
+    # on 30363) so exterior cantilever enforcers never force supports inside walls.
+    mT, raw_encT, encT, extT, gx0, gy0, gzmin, gpx = _enclosed_stack_full(V, T)
+    nl, nx, ny = raw_encT.shape
+    blk_mask = None
+    if raw_encT.sum() * gpx * gpx >= BLOCK_MIN_MM2:
+        A, B, C = V[T[cand, 0]], V[T[cand, 1]], V[T[cand, 2]]
+        N = np.cross(B - A, C - A)
+        nlen = np.maximum(np.linalg.norm(N, axis=1, keepdims=True), 1e-12)
+        Nhat = N / nlen
+        p1 = cen[cand] + 0.3 * Nhat
+        p2 = cen[cand] + 0.6 * Nhat
+        i1 = np.clip(np.floor((p1[:, 0] - gx0) / gpx).astype(np.int64), 0, nx - 1)
+        j1 = np.clip(np.floor((p1[:, 1] - gy0) / gpx).astype(np.int64), 0, ny - 1)
+        k1 = np.clip(np.floor((p1[:, 2] - gzmin) / BLOCK_LAYER).astype(np.int64), 0, nl - 1)
+        i2 = np.clip(np.floor((p2[:, 0] - gx0) / gpx).astype(np.int64), 0, nx - 1)
+        j2 = np.clip(np.floor((p2[:, 1] - gy0) / gpx).astype(np.int64), 0, ny - 1)
+        k2 = np.clip(np.floor((p2[:, 2] - gzmin) / BLOCK_LAYER).astype(np.int64), 0, nl - 1)
+        in_enc = raw_encT[k1, i1, j1] | (mT[k1, i1, j1] & raw_encT[k2, i2, j2])
+        keep = ~in_enc
+        cand, dist = cand[keep], dist[keep]
+        if not len(cand):
+            return []
+        blk_boxes = _socket_blockers_from_stack(
+            mT, encT, extT, gx0, gy0, gzmin, gpx, BLOCK_LAYER
+        )
+        # Keep carved cantilever enforcers strictly outside ALL 2D-enclosed
+        # cavities (both roofed sockets and open-top upside-down cavities like
+        # 30363), their inner walls (+0.75 mm XY), and ceilings (+0.6 mm Z), so
+        # normal(manual) supports never leak inside walls while staying 100%
+        # disjoint from socket_blockers.
+        blk_mask = _boxes_to_mask(blk_boxes, mT.shape, gx0, gy0, gzmin, gpx, BLOCK_LAYER) if blk_boxes else np.zeros_like(mT)
+        pad_r = max(2, int(round(0.75 / gpx)))
+        up_l = max(2, int(np.ceil((BLOCK_UP + BLOCK_LAYER) / BLOCK_LAYER - 1e-9)))
+        enc_dil = np.zeros_like(mT)
+        ed_cache: dict[bytes, np.ndarray] = {}
+        for k in range(nl):
+            if raw_encT[k].any():
+                key = raw_encT[k].tobytes()
+                d2 = ed_cache.get(key)
+                if d2 is None:
+                    d2 = _dilate_2d(raw_encT[k], r=pad_r, border=False)
+                    ed_cache[key] = d2
+                enc_dil[k] = d2
+        for dm in range(1, up_l + 1):
+            enc_dil[dm:] |= enc_dil[:-dm]
+        blk_mask |= enc_dil
+        if not blk_mask.any():
+            blk_mask = None
+
     dmap = dict(zip(cand.tolist(), dist.tolist()))
     bx0, by0 = H.min(axis=0)
     bx1, by1 = H.max(axis=0)
-    # clusters whose XY bboxes overlap belong to one feature (outer and inner
-    # surface of a hollow side stud)
+    # clusters whose XY bboxes genuinely overlap belong to one feature (outer
+    # and inner surface of a hollow side stud); strict overlap prevents hollow
+    # perimeter rims that merely touch at a corner from merging across a cavity.
     groups = []
     for g in _clusters(T, cand):
         P = V[np.unique(T[g])]
@@ -113,8 +252,8 @@ def cantilever_boxes(V, T, protrusion: float = 0.8, margin: float = 0.2,
         for i in range(len(groups)):
             for j in range(i + 1, len(groups)):
                 a, b = groups[i], groups[j]
-                if (a[1][0] <= b[2][0] and b[1][0] <= a[2][0]
-                        and a[1][1] <= b[2][1] and b[1][1] <= a[2][1]):
+                if (a[1][0] < b[2][0] - 1e-3 and b[1][0] < a[2][0] - 1e-3
+                        and a[1][1] < b[2][1] - 1e-3 and b[1][1] < a[2][1] - 1e-3):
                     groups[i] = [np.concatenate([a[0], b[0]]), np.minimum(a[1], b[1]),
                                  np.maximum(a[2], b[2])]
                     groups.pop(j)
@@ -139,10 +278,86 @@ def cantilever_boxes(V, T, protrusion: float = 0.8, margin: float = 0.2,
         if hi[1] <= by0 + eps:
             y1 = min(hi[1], by0)
         z0 = max(zmin0, lo[2] - below)
+        z1 = hi[2] + above
+        prot_r = round(float(prot), 3)
+        area_r = round(float(0.5 * a2[g].sum()), 2)
+
+        # If a curved/hollow exterior feature's AABB overlaps an enclosed cavity
+        # blocker, carve out the interior cavity (B \ blk_mask) using don't-care
+        # slab merging over exterior air + outer skin so enforcers stay compact,
+        # continuous across sloped/curved triangles, and never leak into sockets.
+        if blk_mask is not None:
+            gi0 = max(0, int(np.floor((x0 - gx0) / gpx)))
+            gi1 = min(nx, int(np.ceil((x1 - gx0) / gpx)))
+            gj0 = max(0, int(np.floor((y0 - gy0) / gpx)))
+            gj1 = min(ny, int(np.ceil((y1 - gy0) / gpx)))
+            gk0 = max(0, int(np.floor((z0 - gzmin) / BLOCK_LAYER)))
+            gk1 = min(nl, int(np.ceil((z1 - gzmin) / BLOCK_LAYER)))
+            if gi0 < gi1 and gj0 < gj1 and gk0 < gk1 and blk_mask[gk0:gk1, gi0:gi1, gj0:gj1].any():
+                avail_sub = ~blk_mask[gk0:gk1, gi0:gi1, gj0:gj1]
+                # Require covering exterior air + 1-cell exterior skin (where
+                # overhangs live); remaining solid outside blk_mask is don't-care.
+                n_sub = gk1 - gk0
+                req_sub = np.zeros_like(avail_sub)
+                for dz in range(n_sub):
+                    e2 = extT[gk0 + dz, gi0:gi1, gj0:gj1]
+                    if e2.any():
+                        req_sub[dz] = _dilate_2d(e2, r=1, border=False)
+                req_sub &= avail_sub
+                if not req_sub.any():
+                    continue
+                carved = []
+                kk = 0
+                while kk < n_sub:
+                    if not req_sub[kk].any():
+                        kk += 1
+                        continue
+                    se = req_sub[kk].copy()
+                    sa = avail_sub[kk].copy()
+                    kk1 = kk + 1
+                    while kk1 < n_sub and req_sub[kk1].any():
+                        ne = se | req_sub[kk1]
+                        na = sa & avail_sub[kk1]
+                        if (ne & ~na).any():
+                            break
+                        se, sa = ne, na
+                        kk1 += 1
+                    for ri0, ri1, rj0, rj1 in _cover_with_dontcares(se, sa):
+                        if (ri1 - ri0) * (rj1 - rj0) * gpx * gpx < 0.05:
+                            continue
+                        bx0_c = x0 if ri0 == 0 else max(x0, gx0 + (gi0 + ri0) * gpx)
+                        bx1_c = x1 if ri1 == (gi1 - gi0) else min(x1, gx0 + (gi0 + ri1) * gpx)
+                        by0_c = y0 if rj0 == 0 else max(y0, gy0 + (gj0 + rj0) * gpx)
+                        by1_c = y1 if rj1 == (gj1 - gj0) else min(y1, gy0 + (gj0 + rj1) * gpx)
+                        bz0_c = z0 if kk == 0 else max(z0, gzmin + (gk0 + kk) * BLOCK_LAYER)
+                        bz1_c = z1 if kk1 == n_sub else min(z1, gzmin + (gk0 + kk1) * BLOCK_LAYER)
+                        if (bx1_c - bx0_c) * (by1_c - by0_c) >= 0.05 and bz1_c - bz0_c >= 1e-3:
+                            carved.append([round(float(bx0_c), 3), round(float(bx1_c), 3),
+                                           round(float(by0_c), 3), round(float(by1_c), 3),
+                                           round(float(bz0_c), 3), round(float(bz1_c), 3)])
+                    kk = kk1
+                # Merge carved slabs that share identical XY rectangles in Z
+                c_merged: dict[tuple, list] = {}
+                for cb in sorted(carved, key=lambda b: (b[:4], b[4])):
+                    key = tuple(cb[:4])
+                    m = c_merged.get(key)
+                    if m and m[-1][1] >= cb[4] - 1e-6:
+                        m[-1][1] = max(m[-1][1], cb[5])
+                    else:
+                        c_merged.setdefault(key, []).append([cb[4], cb[5]])
+                for key, zs in c_merged.items():
+                    for cz0, cz1 in zs:
+                        boxes.append({
+                            "box": [*key, cz0, cz1],
+                            "protrusion_mm": prot_r,
+                            "area_mm2": area_r,
+                        })
+                continue
+
         boxes.append({"box": [float(x0), float(x1), float(y0), float(y1), float(z0),
-                              float(lo[2] + above)],
-                      "protrusion_mm": round(float(prot), 3),
-                      "area_mm2": round(float(0.5 * a2[g].sum()), 2)})
+                              float(z1)],
+                      "protrusion_mm": prot_r,
+                      "area_mm2": area_r})
     boxes.sort(key=lambda b: b["box"])
     return boxes
 
@@ -281,60 +496,128 @@ def _cover_with_dontcares(req: np.ndarray, allowed: np.ndarray) -> list[tuple[in
     return rects
 
 
-def socket_blockers(V, T, layer: float = BLOCK_LAYER, px: float = BLOCK_PX) -> list[dict]:
-    """Support-blocker boxes over the enclosed cavities of a posed part.
+BLOCK_WALL_INSET = 0.5  # mm: minimum inset of solid don't-care expansion from exterior air
 
-    A cell of layer k is *enclosed* when it is empty and cannot be reached
-    from outside the part's bounding box within that layer: it is surrounded
-    by the part's own walls (stud socket, tube, vertical hole, any closed
-    hollow).  Support there could never come out, and a stud no longer fits.
-    The layers come from orient.slice_stack (the slicer emulation, robust to
-    LDraw winding).  Each enclosed region becomes boxes that reach BLOCK_UP mm
-    into the ceiling above it (Bambu's blocker acts on the overhang it
-    covers).  Cantilevered features outside the walls are never covered, so
-    support enforcers / auto supports still work there.  This is the same
-    rule verify uses to call support "inside a part" (G-code outlines)."""
+
+def _dilate_2d(M: np.ndarray, r: int, border: bool = True) -> np.ndarray:
+    """Chebyshev dilation of a 2D bool mask by ``r`` cells."""
+    out = M
+    for _ in range(r):
+        p = np.pad(out, 1, constant_values=border)
+        h = p[:, :-2] | p[:, 1:-1] | p[:, 2:]
+        out = h[:-2, :] | h[1:-1, :] | h[2:, :]
+    return out
+
+
+def _boxes_to_mask(
+    boxes, shape: tuple[int, int, int], x0: float, y0: float,
+    zmin: float, px: float, layer: float,
+) -> np.ndarray:
+    nl, nx, ny = shape
+    M = np.zeros(shape, dtype=bool)
+    for ex0, ex1, ey0, ey1, ez0, ez1 in _norm_boxes(boxes):
+        i0 = max(0, int(np.floor((ex0 - x0) / px)))
+        i1 = min(nx, int(np.ceil((ex1 - x0) / px)))
+        j0 = max(0, int(np.floor((ey0 - y0) / px)))
+        j1 = min(ny, int(np.ceil((ey1 - y0) / px)))
+        k0 = max(0, int(np.floor((ez0 - zmin) / layer)))
+        k1 = min(nl, int(np.ceil((ez1 - zmin) / layer)))
+        if i0 < i1 and j0 < j1 and k0 < k1:
+            M[k0:k1, i0:i1, j0:j1] = True
+    return M
+
+
+def _enclosed_stack_full(
+    V, T, layer: float = BLOCK_LAYER, px: float = BLOCK_PX,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float, float, float]:
+    """Slice ``(V, T)`` and classify each layer into solid ``mT``, all 2D-enclosed
+    cavities ``raw_encT`` (including open-top cavities), roofed enclosed cavities
+    ``encT``, and border-reachable external air ``extT``."""
     V = np.asarray(V, dtype=np.float64)
-    zmin = V[:, 2].min()
-    W = V - [0, 0, zmin]
+    zmin = float(V[:, 2].min())
+    W = V - [0.0, 0.0, zmin]
     mask, px = orient.slice_stack(W, T, layer=layer, px=px)
-    nx, ny, nl = mask.shape
-    x0, y0 = orient.SLICE_X0 + W[:, 0].min(), orient.SLICE_Y0 + W[:, 1].min()
-    # Deduplicate identical 2D cross-sections before border flood-fill
+    x0, y0 = orient.SLICE_X0 + float(W[:, 0].min()), orient.SLICE_Y0 + float(W[:, 1].min())
     mT = np.ascontiguousarray(mask.transpose(2, 0, 1))
+    nl = mT.shape[0]
     enc_cache: dict[bytes, np.ndarray] = {}
-    encT = np.zeros_like(mT)
+    ext_cache: dict[bytes, np.ndarray] = {}
+    raw_encT = np.zeros_like(mT)
+    extT = np.zeros_like(mT)
     for k in range(nl):
         key = mT[k].tobytes()
         e2d = enc_cache.get(key)
         if e2d is None:
             free2d = ~mT[k]
-            e2d = free2d & ~_flood_2d_free(free2d)
+            r2d = _flood_2d_free(free2d)
+            e2d = free2d & ~r2d
             enc_cache[key] = e2d
-        encT[k] = e2d
-    # only cavities with something above them need blocking (an overhang)
+            ext_cache[key] = r2d
+        raw_encT[k] = e2d
+        extT[k] = ext_cache[key]
     roofT = np.zeros_like(mT)
     roofT[:-1] = np.flip(np.logical_or.accumulate(np.flip(mT[1:], 0), 0), 0)
-    encT &= roofT
+    encT = raw_encT & roofT
+    return mT, raw_encT, encT, extT, x0, y0, zmin, px
+
+
+def _enclosed_stack(
+    V, T, layer: float = BLOCK_LAYER, px: float = BLOCK_PX,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float, float]:
+    """Slice ``(V, T)`` and classify each layer into solid ``mT``, enclosed
+    roofed cavities ``encT``, and border-reachable external air ``extT``."""
+    mT, _, encT, extT, x0, y0, zmin, px = _enclosed_stack_full(V, T, layer=layer, px=px)
+    return mT, encT, extT, x0, y0, zmin, px
+
+
+def _socket_blockers_from_stack(
+    mT: np.ndarray,
+    encT: np.ndarray,
+    extT: np.ndarray,
+    x0: float,
+    y0: float,
+    zmin: float,
+    px: float,
+    layer: float,
+    exclude=None,
+) -> list[dict]:
+    nl, nx, ny = mT.shape
     if encT.sum() * px * px < BLOCK_MIN_MM2:
         return []
-    # A blocker may safely overlap the part's own solid material (nothing is
-    # supported there anyway), but must never enter external air (~allowed).
-    # Group consecutive Z layers into slabs while union(enc) <= intersection(allowed),
-    # then cover each slab's enclosed cells with minimal rectangles inside allowed.
-    allowedT = encT | mT
+    # Erode solid material away from external air before allowing don't-care
+    # expansion so blocker boxes stay strictly interior (>= 0.5 mm inset from
+    # exterior skin) and never bleed onto curved outer walls.
+    erode_r = max(1, int(round(BLOCK_WALL_INSET / px)))
+    dil_cache: dict[bytes, np.ndarray] = {}
+    allowedT = np.zeros_like(mT)
+    for k in range(nl):
+        key = extT[k].tobytes()
+        d2d = dil_cache.get(key)
+        if d2d is None:
+            d2d = _dilate_2d(extT[k], r=erode_r)
+            dil_cache[key] = d2d
+        allowedT[k] = encT[k] | (mT[k] & ~d2d)
+
+    excl_boxes = _norm_boxes(exclude)
+    exclT = _boxes_to_mask(excl_boxes, mT.shape, x0, y0, zmin, px, layer) if excl_boxes else None
+    enc_work = encT & ~exclT if exclT is not None else encT
+    all_work = allowedT & ~exclT if exclT is not None else allowedT
+    if enc_work.sum() * px * px < BLOCK_MIN_MM2:
+        return []
+
+    up_layers = max(1, int(np.ceil(BLOCK_UP / layer - 1e-9)))
     boxes = []
     k = 0
     while k < nl:
-        if not encT[k].any():
+        if not enc_work[k].any():
             k += 1
             continue
-        slab_enc = encT[k].copy()
-        slab_all = allowedT[k].copy()
+        slab_enc = enc_work[k].copy()
+        slab_all = all_work[k].copy()
         k1 = k + 1
-        while k1 < nl and encT[k1].any():
-            nxt_enc = slab_enc | encT[k1]
-            nxt_all = slab_all & allowedT[k1]
+        while k1 < nl and enc_work[k1].any():
+            nxt_enc = slab_enc | enc_work[k1]
+            nxt_all = slab_all & all_work[k1]
             if (nxt_enc & ~nxt_all).any():
                 break
             slab_enc = nxt_enc
@@ -343,10 +626,23 @@ def socket_blockers(V, T, layer: float = BLOCK_LAYER, px: float = BLOCK_PX) -> l
         for i0, i1, j0, j1 in _cover_with_dontcares(slab_enc, slab_all):
             if (i1 - i0) * (j1 - j0) * px * px < 0.05:
                 continue
-            boxes.append({"box": [round(float(x0 + i0 * px), 3), round(float(x0 + i1 * px), 3),
-                                  round(float(y0 + j0 * px), 3), round(float(y0 + j1 * px), 3),
-                                  round(float(zmin + k * layer), 3),
-                                  round(float(zmin + k1 * layer + BLOCK_UP), 3)]})
+            # Ensure top BLOCK_UP extension never pokes into external air or excluded zones
+            safe_up = 0
+            for dm in range(up_layers):
+                m = k1 + dm
+                if m >= nl:
+                    break
+                if extT[m, i0:i1, j0:j1].any() or (exclT is not None and exclT[m, i0:i1, j0:j1].any()):
+                    break
+                safe_up = dm + 1
+            bx = {"box": [round(float(x0 + i0 * px), 3), round(float(x0 + i1 * px), 3),
+                          round(float(y0 + j0 * px), 3), round(float(y0 + j1 * px), 3),
+                          round(float(zmin + k * layer), 3),
+                          round(float(zmin + (k1 + safe_up) * layer), 3)]}
+            if excl_boxes:
+                boxes.extend(subtract_boxes([bx], excl_boxes))
+            else:
+                boxes.append(bx)
         k = k1
     # stacked slabs sharing identical XY rectangles: merge in z
     merged: dict[tuple, list] = {}
@@ -360,6 +656,26 @@ def socket_blockers(V, T, layer: float = BLOCK_LAYER, px: float = BLOCK_PX) -> l
     out = [{"box": [*k, z0, z1]} for k, zs in merged.items() for z0, z1 in zs]
     out.sort(key=lambda b: b["box"])
     return out
+
+
+def socket_blockers(
+    V, T, layer: float = BLOCK_LAYER, px: float = BLOCK_PX, exclude=None,
+) -> list[dict]:
+    """Support-blocker boxes over the enclosed cavities of a posed part.
+
+    A cell of layer k is *enclosed* when it is empty and cannot be reached
+    from outside the part's bounding box within that layer: it is surrounded
+    by the part's own walls (stud socket, tube, vertical hole, any closed
+    hollow).  Support there could never come out, and a stud no longer fits.
+    The layers come from orient.slice_stack (the slicer emulation, robust to
+    LDraw winding).  Each enclosed region becomes boxes that reach up to
+    BLOCK_UP mm into the ceiling above it without entering external air.
+    Optional ``exclude`` boxes (e.g. ``cantilever_boxes`` enforcers) are
+    clipped out so blockers never overlap or cancel enforcers."""
+    mT, encT, extT, x0, y0, zmin, px = _enclosed_stack(V, T, layer=layer, px=px)
+    return _socket_blockers_from_stack(
+        mT, encT, extT, x0, y0, zmin, px, layer, exclude=exclude
+    )
 
 
 def ceiling_extent(V, T) -> tuple[float, float] | None:

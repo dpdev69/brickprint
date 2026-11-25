@@ -439,7 +439,7 @@ def probe(cfg: dict, parts: dict, cache: VerdictCache, bambu: str,
 # whole-project check
 # --------------------------------------------------------------------------
 
-PLATE_CHECK_RUNS = 2        # independent full slices; a plate flagged by any run counts
+PLATE_CHECK_RUNS = 3        # independent full slices; matches CONFIRM_RUNS for stochastic floaters
 
 
 def _project_hash(path: Path) -> str:
@@ -490,7 +490,7 @@ def _plate_check_slices(cfg, bambu, project, root, runs, workers, log, plates,
     with ``--slice 0`` (1 Bambu project load per run instead of one per plate).
     Populates ``gcode_cache`` for cleanly sliced plates when ``pkeys`` is set.
     """
-    from .verify import slice_plates
+    from .verify import _extract_plate_warnings, slice_plates
     import xml.etree.ElementTree as ET
     import zipfile
 
@@ -545,15 +545,14 @@ def _plate_check_slices(cfg, bambu, project, root, runs, workers, log, plates,
         for new_pid, why in failed.items():
             orig_pid = new_to_orig.get(new_pid, new_pid)
             errors.setdefault(orig_pid, why[:300])
-        for m in _WARN.finditer(text):
-            msg = m.group(2).strip()
-            new_pid = int(m.group(1))
+        for new_pid, msgs in _extract_plate_warnings(text).items():
             orig_pid = new_to_orig.get(new_pid, new_pid)
-            if msg and msg not in per_plate_warns.get(orig_pid, ()):
-                per_plate_warns.setdefault(orig_pid, []).append(msg)
-            if "floating" in msg or "empty layer" in msg:
-                if msg[:200] not in flagged.get(orig_pid, ""):
-                    flagged[orig_pid] = (flagged[orig_pid] + " | " if orig_pid in flagged else "") + msg[:200]
+            for msg in msgs:
+                if msg and msg not in per_plate_warns.get(orig_pid, ()):
+                    per_plate_warns.setdefault(orig_pid, []).append(msg)
+                if "floating" in msg or "empty layer" in msg:
+                    if msg[:200] not in flagged.get(orig_pid, ""):
+                        flagged[orig_pid] = (flagged[orig_pid] + " | " if orig_pid in flagged else "") + msg[:200]
         if pkeys and gcode_cache is not None:
             for new_pid, gpath in (gfiles or {}).items():
                 orig_pid = new_to_orig.get(new_pid, new_pid)
@@ -636,11 +635,13 @@ def plate_check(cfg: dict, bambu: str, project: Path, runs: int | None = None,
             entry_key = f"plate:{pk}:p{PROBE_VERSION}:x{runs}"
             if entry_key in known:
                 rec = known[entry_key]
-                if isinstance(rec, dict):
+                if isinstance(rec, dict) and not rec.get("error"):
                     if rec.get("msg"):
                         cached_flagged[pid] = rec["msg"]
-                    if rec.get("error"):
-                        cached_errors[pid] = rec["error"]
+                else:
+                    # Never trust cached slicer errors (transient crashes or
+                    # earlier filter bugs); re-slice instead.
+                    uncached.append(pid)
             else:
                 uncached.append(pid)
         if not uncached:
@@ -661,17 +662,16 @@ def plate_check(cfg: dict, bambu: str, project: Path, runs: int | None = None,
         finally:
             _remove_workdir(root)
 
-        # Cached only when every run completed (an exception never gets here)
+        # Cached only for plates that sliced cleanly (never persist transient
+        # slicer errors into plate_checks.json).
         for pid in uncached:
             pk = pkeys.get(pid)
-            if pk is None:
+            if pk is None or pid in new_errors:
                 continue
             entry_key = f"plate:{pk}:p{PROBE_VERSION}:x{runs}"
             rec = {}
             if pid in new_flagged:
                 rec["msg"] = new_flagged[pid]
-            if pid in new_errors:
-                rec["error"] = new_errors[pid]
             known[entry_key] = rec
         _write_json_atomic(cache_file, known)
 
@@ -786,14 +786,12 @@ def check_final(cfg: dict, bambu: str, parts: dict, cache: VerdictCache, runs: i
             ci, r = job
             d = root / f"c{ci}_r{r}"
             d.mkdir()
-            from .verify import slice_plates
+            from .verify import _extract_plate_warnings, slice_plates
             _, text, failed = slice_plates(bambu, srcs[ci], d, list(range(1, len(chunks[ci]) + 1)),
                                            log=lambda *_: None, timeout=TIMEOUT_S)
             _remove_gcodes(d)
             res = {}
-            warns: dict[int, list[str]] = {}
-            for m in _WARN.finditer(text):
-                warns.setdefault(int(m.group(1)), []).append(m.group(2).strip())
+            warns = _extract_plate_warnings(text)
             for pi, n in enumerate(chunks[ci], 1):
                 t = " | ".join(warns.get(pi, []))
                 res[n] = {"float": "floating regions" in t, "cant": "cantilever" in t,

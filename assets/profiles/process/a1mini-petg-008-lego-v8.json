@@ -1,7 +1,7 @@
 {
   "kind": "process",
   "name": "a1mini-petg-008-lego-v8",
-  "description": "A1 mini 0.4, 0.08 mm, slow PETG walls, LEGO clutch fit, enforcer-only supports, plus ceiling recipe 8: plate sockets 2.2 mm deep, thick anchored ceiling bridges, span-cutting ribs (Seagull v8; recipe chosen from the printed v7 ceiling test). Low-cleanup variant: no brim except on parts with under 20 mm2 of bed contact, lighter support contact. Recommended PETG profile.",
+  "description": "A1 mini 0.4, 0.08 mm, slow PETG walls, LEGO clutch fit, gyroid infill, elephant-foot compensation, enforcer-only supports with unified 0.24 mm Z-gap (thick_bridges=0, 3 spaced interface layers @ 0.35 mm), plus ceiling recipe 8: plate sockets 2.2 mm deep, 0.24 mm anchored ceiling bridge bands, span-cutting ribs. Per-object outer brim on small-contact (<20 mm2) or tall slender (H/eqD >= 2.5, H >= 15 mm) parts. Recommended PETG profile.",
   "printer": "Bambu Lab A1 mini 0.4 nozzle",
   "base_process": "0.08mm Extra Fine @BBL A1M",
   "default_filament": "Bambu PETG Basic @BBL A1M 0.4 nozzle",
@@ -22,13 +22,14 @@
     "x_long_angle": 90
   },
   "lego_safety": {
-    "thick_bridges": "1 (safe only with ceilings recipe8: sockets are raised to 2.2 mm)"
+    "thick_bridges": "0 (ceilings recipe8 supplies 0.24 mm bridge height-range bands for socket ceilings while thick_bridges=0 keeps normal(manual) and tree(auto) support Z-gaps unified at 0.24 mm physical air without 0.72 mm cliffs under curved overhangs)"
   },
   "overrides": {
     "bottom_shell_layers": 5,
     "bridge_angle": 180,
     "bridge_speed": 25,
     "brim_type": "no_brim",
+    "elefant_foot_compensation": 0.1,
     "enable_prime_tower": 0,
     "enable_support": 1,
     "gap_infill_speed": 80,
@@ -42,20 +43,21 @@
     "skeleton_infill_density": "5%",
     "skin_infill_density": "5%",
     "sparse_infill_density": "30%",
+    "sparse_infill_pattern": "gyroid",
     "sparse_infill_speed": 120,
     "support_base_pattern": "rectilinear",
     "support_base_pattern_spacing": 1,
     "support_interface_pattern": "rectilinear_interlaced",
-    "support_interface_spacing": 0.5,
+    "support_interface_spacing": 0.35,
     "support_interface_speed": 40,
-    "support_interface_top_layers": 2,
+    "support_interface_top_layers": 3,
     "support_object_xy_distance": 0.4,
     "support_on_build_plate_only": 1,
     "support_remove_small_overhang": 0,
     "support_speed": 60,
-    "support_top_z_distance": 0.32,
+    "support_top_z_distance": 0.24,
     "support_type": "normal(manual)",
-    "thick_bridges": 1,
+    "thick_bridges": 0,
     "top_shell_layers": 6,
     "top_surface_speed": 80,
     "travel_speed": 400,
@@ -63,13 +65,15 @@
     "wall_loops": 4,
     "wall_sequence": "inner-outer-inner wall"
   },
-  "provenance": "Seagull MMMB027-1 v8 (seagull/build_ceiling_v6.py + build_bridges_v8.py), CLI-verified 2026-11-11; full Seagull printed and assembled from the brickprint-built v9 file; 2026-11-11 after the full Seagull print: brim off by default, support gap 0.24->0.32 with 2 interface layers at 0.5 spacing, cone 59900 hole compensation -0.08 (confirmed on a printed test plate 2026-11-11)",
+  "provenance": "Seagull MMMB027-1 v8 (seagull/build_ceiling_v6.py + build_bridges_v8.py), CLI-verified 2026-11-11; updated 2026-11-25 after Enzo 8652-1 G-code audit: gyroid infill, elefant_foot_compensation 0.10, thick_bridges=0 with support_top_z_distance 0.24 + 3 interface layers @ 0.35 mm spacing (CLI G-code verified +0.243 mm physical air gap on both normal(manual) and tree(auto) supports while recipe8 0.24 mm bands keep thick 0.21-0.34 mm socket bridges), plus slender-part brim eligibility (H/eqD >= 2.5, H >= 15 mm); --fit 0.03 clutch compatibility preserved",
   "ceilings": {
     "mode": "recipe8"
   },
   "brim": {
     "mode": "small-contact",
     "contact_mm2": 20,
+    "slender_ratio": 2.5,
+    "slender_min_height_mm": 15,
     "width_mm": 3,
     "gap_mm": 0.2
   },

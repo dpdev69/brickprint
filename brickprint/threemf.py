@@ -200,6 +200,46 @@ def _matrix(x: float, y: float) -> str:
     return f"1 0 0 {x:.4f} 0 1 0 {y:.4f} 0 0 1 0 0 0 0 1"
 
 
+def _merge_bands(bands: list[tuple[float, float, dict]]) -> list[tuple[float, float, dict]]:
+    """Merge height-range bands from multiple parts in a merged Bambu object
+    into sorted, non-overlapping ``(z0, z1, opts)`` ranges."""
+    if len(bands) <= 1:
+        return list(bands)
+    raw_pts = sorted(p for z0, z1, _ in bands for p in (float(z0), float(z1)))
+    pts: list[float] = []
+    for p in raw_pts:
+        if not pts or p - pts[-1] > 1e-4:
+            pts.append(p)
+    merged: list[tuple[float, float, dict]] = []
+    for za, zb in zip(pts, pts[1:]):
+        if zb - za <= 1e-4:
+            continue
+        mid = 0.5 * (za + zb)
+        active = [opts for z0, z1, opts in bands if float(z0) <= mid <= float(z1)]
+        if not active:
+            continue
+        opts: dict[str, str] = {}
+        for d in active:
+            for k, v in d.items():
+                sv = str(v)
+                if k not in opts:
+                    opts[k] = sv
+                elif k == "layer_height":
+                    # Finest layer height wins (preserves 0.08 mm slope-safe anchor bands)
+                    if float(sv) < float(opts[k]):
+                        opts[k] = sv
+                elif k == "wall_loops":
+                    # Fewest wall loops wins (preserves 2-wall bridge anchoring)
+                    if int(sv) < int(opts[k]):
+                        opts[k] = sv
+        z0_r, z1_r = round(za, 4), round(zb, 4)
+        if merged and abs(merged[-1][1] - z0_r) <= 1e-4 and merged[-1][2] == opts:
+            merged[-1] = (merged[-1][0], z1_r, opts)
+        else:
+            merged.append((z0_r, z1_r, opts))
+    return merged
+
+
 def write_project(
     cfg: dict,
     set_info: dict,
@@ -270,7 +310,12 @@ def write_project(
         for part_file in sorted(auto_files):
             if "blocker" not in meshes[part_file]:
                 from . import features
-                bx = features.socket_blockers(meshes[part_file]["V"], meshes[part_file]["T"])
+                excl = meshes[part_file].get("enforcer_boxes")
+                if excl is None and meshes[part_file].get("enforcer") is not None:
+                    excl = features.mesh_boxes(*meshes[part_file]["enforcer"])
+                bx = features.socket_blockers(
+                    meshes[part_file]["V"], meshes[part_file]["T"], exclude=excl
+                )
                 meshes[part_file]["blocker"] = features.box_mesh(bx) if bx else None
         mids = {}
         for part_file in files:
@@ -418,9 +463,20 @@ def write_project(
                     f'transform="1 0 0 0 1 0 0 0 1 {bx:.3f} {by:.3f} 0" printable="1"/>'
                 )
                 object_seq += 1
-                if len(obj["items"]) == 1 and meshes[obj["items"][0][0]].get("bands"):
+                obj_bands: list[tuple[float, float, dict]] = []
+                if len(obj["items"]) == 1:
+                    obj_bands = list(meshes[obj["items"][0][0]].get("bands") or ())
+                else:
+                    raw_bands: list[tuple[float, float, dict]] = []
+                    for pf in dict.fromkeys(it[0] for it in obj["items"]):
+                        b = meshes[pf].get("bands")
+                        if b:
+                            raw_bands.extend(b)
+                    if raw_bands:
+                        obj_bands = _merge_bands(raw_bands)
+                if obj_bands:
                     rng = [f' <object id="{object_seq}">']
-                    for z0, z1, opts in meshes[obj["items"][0][0]]["bands"]:
+                    for z0, z1, opts in obj_bands:
                         rng.append(f'  <range min_z="{z0:g}" max_z="{z1:g}">')
                         rng.append('   <option opt_key="extruder">0</option>')
                         for k, v in sorted(opts.items()):
