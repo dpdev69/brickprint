@@ -25,6 +25,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from . import slice_cache
+
 NO_SWEEP_ENV = "BRICKPRINT_NO_SWEEP"
 SWEEP_DAYS = 3.0
 VERIFY_KEEP_GB = 2.0
@@ -106,6 +108,16 @@ def sweep_workdirs(cfg: dict, temp_root: Path | str | None = None,
                 continue
             found.append((p, is_verify, size, newest))
 
+    # Also sweep stale leftover dirs under cache_root/bambu/<uuid>/
+    bambu_dir = cache_root / "bambu"
+    if bambu_dir.is_dir() and not bambu_dir.is_symlink():
+        for p in _candidates(bambu_dir, ("",), excl):
+            try:
+                size, newest = _usage(p)
+            except OSError:
+                continue
+            found.append((p, False, size, newest))
+
     def remove(item) -> bool:
         p, _, size, _ = item
         shutil.rmtree(p, ignore_errors=True)
@@ -135,6 +147,18 @@ def sweep_workdirs(cfg: dict, temp_root: Path | str | None = None,
                 continue
             if remove(item):
                 total -= item[2]
+    # Best-effort remove cache_root/bambu if emptied
+    if bambu_dir.is_dir() and not bambu_dir.is_symlink():
+        try:
+            bambu_dir.rmdir()
+        except OSError:
+            pass
+    # Keep the shared content-addressed G-code cache bounded (TTL + LRU size cap)
+    gcode_cache_dir = cache_root / "gcode_cache"
+    if gcode_cache_dir.is_dir() and not gcode_cache_dir.is_symlink():
+        ev = slice_cache.evict(gcode_cache_dir, now=now)
+        res["removed"] += ev["removed"]
+        res["freed"] += ev["freed"]
     if res["removed"]:
         mb = res["freed"] / 1024 ** 2
         size = f"{mb / 1024:.2f} GB" if mb >= 1024 else f"{mb:.1f} MB"

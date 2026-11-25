@@ -1,11 +1,22 @@
 # Bambu Studio 3MF notes
 
-## Why one object per plate
+## Object layout (per plate vs per part)
 
-A plate is one Bambu object containing every part on that plate as a component
-(fit-test and calibration plates are the exception: one object per piece, so
-each can carry per-object X-Y compensation; Bambu ignores it per part).
-This:
+Default PLA builds (`a1mini-pla-stock`) write one Bambu object per plate
+containing every part on that plate as a component. Exceptions that write
+multiple objects per plate:
+
+- **Socket ceilings (`--ceilings recipe8`, default in `a1mini-petg-008-lego-v8`):**
+  every part instance is its own Bambu object, because height-range modifiers
+  (`layer_config_ranges.xml`) and per-object brims/fit overrides apply per
+  object.
+- **Mixed-colour plates (`--mix-colours`):** one object per colour group (or
+  one object per part under `recipe8`), because extruder assignment is per
+  object.
+- **Fit-test and calibration plates:** one object per test piece, so each can
+  carry per-object X-Y compensation (Bambu ignores it per part).
+
+Using one object per plate on stock builds:
 
 - keeps the layout stable when Bambu re-exports the project,
 - lets the object carry one extruder/color,
@@ -20,7 +31,8 @@ re-center each plate assembly and add plate thumbnails.
 `assets/a1mini_pla_project_settings.json`. That file is the resolved stock
 chain (`Bambu Lab A1 mini 0.4 nozzle` + its `include`d G-code template files,
 `Bambu PLA Basic @BBL A1M`, `0.20mm Standard @BBL A1M`, each followed through
-`inherits`), built by `brickprint profiles regen-template` (`brickprint/bambu_profiles.py`; the project's `tools/build_settings_template.py` is the original). The only deviation is
+`inherits`), built by `brickprint profiles regen-template`
+(`brickprint/bambu_profiles.py`). The only deviation is
 `curr_bed_type = Textured PEI Plate`; `different_settings_to_system` is all
 empty strings, so Bambu shows the presets as unmodified system presets.
 

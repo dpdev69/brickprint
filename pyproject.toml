@@ -9,7 +9,7 @@ description = "Turn a LEGO set into a colour-grouped, multi-plate Bambu Studio 3
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "LICENSES/AGPL-3.0.txt", "THIRD_PARTY_NOTICES.md"]
 # numpy is the only third-party import in brickprint/*.py; the rest is stdlib.
 dependencies = ["numpy"]
 

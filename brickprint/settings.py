@@ -244,6 +244,12 @@ class Composer:
                        and not self.filament_specs
                        and self.supports_mode == "plates" and self.bridging_mode == "stock")
         self._fil_cache: dict[str, dict] = {}
+        self._base_cache: dict | None = None
+        self._legacy_base_cache: dict | None = None
+        self._proc_chain_cache: tuple[str, dict] | None = None
+        self._mach_chain_cache: tuple[str, dict] | None = None
+        self._raw_fil_cache: dict[str, tuple[dict, dict]] = {}
+        self._fingerprint_cache: str | None = None
         self.warnings: list[str] = []
         self._used_specs: set[str] = set()
 
@@ -297,14 +303,26 @@ class Composer:
         return [s for s in self.filament_specs if "=" in s and s not in self._used_specs]
 
     def _base(self) -> dict:
-        if self.snapshot:
-            t = json.loads(Path(self.cfg["settings"]).read_text())
-            t.update({"curr_bed_type": self.cfg.get("bed_type", "Textured PEI Plate")})
-            return t
-        p = self.profile
-        return bp.build_template(self.app, p.get("printer", bp.MACHINE), p["base_process"],
-                                 p.get("default_filament", bp.FILAMENT),
-                                 overrides={"curr_bed_type": p.get("bed_type", "Textured PEI Plate")})
+        if self._base_cache is None:
+            if self.snapshot:
+                t = json.loads(Path(self.cfg["settings"]).read_text())
+                t.update({"curr_bed_type": self.cfg.get("bed_type", "Textured PEI Plate")})
+                self._base_cache = t
+            else:
+                p = self.profile
+                self._base_cache = bp.build_template(
+                    self.app, p.get("printer", bp.MACHINE), p["base_process"],
+                    p.get("default_filament", bp.FILAMENT),
+                    overrides={"curr_bed_type": p.get("bed_type", "Textured PEI Plate")},
+                )
+        return copy.deepcopy(self._base_cache)
+
+    def _raw_filament(self, base_name: str) -> tuple[dict, dict]:
+        if base_name not in self._raw_fil_cache:
+            raw = bp.raw_chain(self.app, "filament", base_name)
+            fch = {k: v for k, v in raw.items() if k not in bp.META}
+            self._raw_fil_cache[base_name] = (raw, fch)
+        return self._raw_fil_cache[base_name]
 
     # -- main ---------------------------------------------------------------
     def compose(self, slots: list[dict], verdict: bool = False) -> dict:
@@ -312,7 +330,9 @@ class Composer:
         from . import threemf
         hexes = ["#" + s["hex"].lstrip("#") for s in slots]
         if self.legacy:
-            settings = json.loads(Path(self.cfg["settings"]).read_text())
+            if self._legacy_base_cache is None:
+                self._legacy_base_cache = json.loads(Path(self.cfg["settings"]).read_text())
+            settings = copy.deepcopy(self._legacy_base_cache)
             settings.update({
                 "filament_type": [self.cfg.get("filament_type", "PLA")],
                 "filament_settings_id": [self.cfg.get("filament_settings_id", "Bambu PLA Basic @BBL A1M")],
@@ -327,20 +347,26 @@ class Composer:
         T = self._base()
         per = T.pop("_brickprint_per_filament_keys")
         base_proc = T.get("print_settings_id") or bp.PROCESS
+        base_mach = T.get("printer_settings_id") or bp.MACHINE
         default_fil = (T.get("filament_settings_id") or [bp.FILAMENT])[0]
         if self.snapshot:
             default_fil = self.cfg.get("filament_settings_id", default_fil)
-        proc_chain = bp.chain(self.app, "process", base_proc)
-        mach_chain = bp.chain(self.app, "machine", T.get("printer_settings_id") or bp.MACHINE)
+        if self._proc_chain_cache is None or self._proc_chain_cache[0] != base_proc:
+            self._proc_chain_cache = (base_proc, bp.chain(self.app, "process", base_proc))
+        if self._mach_chain_cache is None or self._mach_chain_cache[0] != base_mach:
+            self._mach_chain_cache = (base_mach, bp.chain(self.app, "machine", base_mach))
+        proc_chain = self._proc_chain_cache[1]
+        mach_chain = self._mach_chain_cache[1]
         n = len(slots)
         S = copy.deepcopy(T)
         values = {k: [] for k in per}
         fdiffs = []
+        slot_fps = []
         for i, slot in enumerate(slots):
             fp = self.filament_for(slot, keep_slot_colour=n > 1)
+            slot_fps.append(fp)
             base_name = (fp or {}).get("base_filament") or default_fil
-            raw = bp.raw_chain(self.app, "filament", base_name)
-            fch = {k: v for k, v in raw.items() if k not in bp.META}
+            raw, fch = self._raw_filament(base_name)
             vals = {}
             for k in per:
                 src = fch.get(k, T[k])
@@ -386,10 +412,10 @@ class Composer:
         S["inherits_group"] = [""] * (n + 2)
         if verdict:
             S["enable_support"] = "0"
-        self.validate(S, slots)
+        self.validate(S, slots, fps=slot_fps)
         return S
 
-    def validate(self, S: dict, slots: list[dict]) -> None:
+    def validate(self, S: dict, slots: list[dict], fps: list[dict | None] | None = None) -> None:
         bad = [k for k, v in S.items()
                if not (isinstance(v, str) or (isinstance(v, list) and all(isinstance(x, str) for x in v)))]
         if bad:
@@ -406,7 +432,7 @@ class Composer:
             if not lo <= t <= hi:
                 raise ProfileError(f"filament slot {i + 1}: nozzle {t:g} C outside its preset range "
                                    f"{lo:g}-{hi:g} C")
-            fp = self.filament_for(slots[i])
+            fp = fps[i] if fps is not None else self.filament_for(slots[i])
             mf = (fp or {}).get("manufacturer") or {}
             rng = mf.get("nozzle_temperature_c")
             if rng and not rng[0] <= t <= rng[1]:
@@ -422,9 +448,11 @@ class Composer:
         short hash of the verdict-relevant settings of a one-slot probe."""
         if self.legacy:
             return ""
-        S = self.compose([{"color_id": "probe", "color_name": "probe", "hex": "FFFFFF"}], verdict=True)
-        blob = json.dumps({k: S.get(k) for k in FINGERPRINT_KEYS}, sort_keys=True)
-        return hashlib.sha1(blob.encode()).hexdigest()[:10]
+        if self._fingerprint_cache is None:
+            S = self.compose([{"color_id": "probe", "color_name": "probe", "hex": "FFFFFF"}], verdict=True)
+            blob = json.dumps({k: S.get(k) for k in FINGERPRINT_KEYS}, sort_keys=True)
+            self._fingerprint_cache = hashlib.sha1(blob.encode()).hexdigest()[:10]
+        return self._fingerprint_cache
 
     def summary(self) -> dict:
         return {

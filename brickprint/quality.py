@@ -27,7 +27,7 @@ def part_report(part_file: str, V, T, export_info: dict | None = None) -> dict:
     m = repair.mesh_metrics(V, T)
     rings = features.stud_rings(V, T)
     studs = [r for r in rings if abs(r["d"] - STUD_D) < 0.5]
-    size = (V.max(axis=0) - V.min(axis=0)).tolist()
+    size = (V.max(axis=0) - V.min(axis=0)).tolist() if len(V) else [0.0, 0.0, 0.0]
     flags = []
     segs = sorted({r["segments"] for r in studs})
     if segs and min(segs) < 48:
@@ -61,10 +61,13 @@ def part_report(part_file: str, V, T, export_info: dict | None = None) -> dict:
     }
 
 
-def report(cache, part_files) -> list[dict]:
+def report(cache, part_files, meshes: dict[str, dict] | None = None) -> list[dict]:
     out = []
     for pf in sorted(part_files):
-        V, T = cache.get(pf)
+        if meshes is not None and pf in meshes:
+            V, T = meshes[pf]["V"], meshes[pf]["T"]
+        else:
+            V, T = cache.get(pf)
         out.append(part_report(pf, V, T, cache.export_info(pf)))
     return out
 

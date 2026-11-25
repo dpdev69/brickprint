@@ -24,9 +24,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import subprocess
 import tempfile
+import threading
 import xml.etree.ElementTree as ET
 import zipfile
 from collections import defaultdict
@@ -35,12 +37,16 @@ from pathlib import Path
 
 import numpy as np
 
-from . import features, gcode
+from . import features, gcode, slice_cache
 from .settings import norm
 
 NS = {"c": "http://schemas.microsoft.com/3dmanufacturing/core/2015/02"}
 P_NS = "{http://schemas.microsoft.com/3dmanufacturing/production/2015/06}"
 SUPPORT_FEATS = ("Support", "Support interface", "Support transition")
+ANALYSE_FEATURES = frozenset({"Outer wall", "Bridge", *SUPPORT_FEATS})
+_OBJ_ID_ATTR_RE = re.compile(rb'\bid="([^"]+)"')
+_VERTEX_RE = re.compile(rb'<vertex\s+x="([^"]+)"\s+y="([^"]+)"\s+z="([^"]+)"')
+_TRIANGLE_RE = re.compile(rb'<triangle\s+v1="([^"]+)"\s+v2="([^"]+)"\s+v3="([^"]+)"')
 STUD_RANGE = (4.3, 5.4)
 CAVITY_Z = 1.0
 STUD_DEPTH = 0.8
@@ -119,14 +125,40 @@ def _compose(inner: np.ndarray, outer: np.ndarray) -> np.ndarray:
     return np.vstack([R, t])
 
 
-def read_project(path: Path) -> dict:
-    z = zipfile.ZipFile(path)
-    names = z.namelist()
-    meshes = {}
-    for name in names:
-        if not (name.startswith("3D/Objects/") and name.endswith(".model")):
+def _parse_object_model(name: str, raw: bytes, meshes: dict) -> None:
+    """Fast regex + ``np.fromiter`` mesh parser for ``3D/Objects/*.model``,
+    falling back to ElementTree if attributes appear in non-standard order."""
+    parsed = False
+    pos = 0
+    while True:
+        start = raw.find(b"<object", pos)
+        if start < 0:
+            break
+        gt = raw.find(b">", start)
+        if gt < 0:
+            break
+        end = raw.find(b"</object>", gt)
+        if end < 0:
+            break
+        attrs = raw[start + 7:gt]
+        body = raw[gt + 1:end]
+        pos = end + 9
+        im = _OBJ_ID_ATTR_RE.search(attrs)
+        if not im:
             continue
-        root = ET.fromstring(z.read(name))
+        oid = im.group(1).decode("utf-8", errors="replace")
+        vs = _VERTEX_RE.findall(body)
+        if not vs:
+            continue
+        ts = _TRIANGLE_RE.findall(body)
+        V = np.fromiter((float(c) for row in vs for c in row), dtype=np.float64,
+                        count=len(vs) * 3).reshape(-1, 3)
+        T = np.fromiter((int(c) for row in ts for c in row), dtype=np.int64,
+                        count=len(ts) * 3).reshape(-1, 3) if ts else np.empty((0, 3), dtype=np.int64)
+        meshes[("/" + name, oid)] = (V, T)
+        parsed = True
+    if not parsed and b"<vertex" in raw:
+        root = ET.fromstring(raw)
         for obj in root.findall(".//c:object", NS):
             vs = obj.findall(".//c:vertex", NS)
             if not vs:
@@ -135,47 +167,69 @@ def read_project(path: Path) -> dict:
             T = np.array([[int(t.get("v1")), int(t.get("v2")), int(t.get("v3"))]
                           for t in obj.findall(".//c:triangle", NS)])
             meshes[("/" + name, obj.get("id"))] = (V, T)
-    root = ET.fromstring(z.read("3D/3dmodel.model"))
-    comps, items = {}, {}
-    for obj in root.findall("c:resources/c:object", NS):
-        cl = []
-        for c in obj.findall(".//c:component", NS):
-            cl.append(((c.get(P_NS + "path") or "").replace("//", "/"), c.get("objectid"),
-                       _tr(c.get("transform") or "1 0 0 0 1 0 0 0 1 0 0 0")))
-        comps[obj.get("id")] = cl
-    for it in root.findall("c:build/c:item", NS):
-        items[it.get("objectid")] = _tr(it.get("transform") or "1 0 0 0 1 0 0 0 1 0 0 0")
-    ms = ET.fromstring(z.read("Metadata/model_settings.config"))
-    objmeta, subtypes, pnames = {}, {}, {}
-    for o in ms.findall("object"):
-        objmeta[o.get("id")] = {m.get("key"): m.get("value") for m in o.findall("metadata") if m.get("key")}
-        subtypes[o.get("id")] = [p.get("subtype", "normal_part") for p in o.findall("part")]
-        pnames[o.get("id")] = [(p.find("metadata[@key='name']").get("value")
-                                if p.find("metadata[@key='name']") is not None else "")
-                               for p in o.findall("part")]
-    plates = []
-    for pl in ms.findall("plate"):
-        pid = int(pl.find("metadata[@key='plater_id']").get("value"))
-        pname = pl.find("metadata[@key='plater_name']").get("value")
-        objs = []
-        for mi in pl.findall("model_instance"):
-            oid = mi.find("metadata[@key='object_id']").get("value")
-            ident = int(mi.find("metadata[@key='identify_id']").get("value"))
-            st = subtypes.get(oid) or []
-            nm = pnames.get(oid) or []
-            parts = []
-            for k, (mpath, mid, M) in enumerate(comps.get(oid, [])):
-                sub = st[k] if k < len(st) else "normal_part"
-                W = _compose(M, items.get(oid, _tr("1 0 0 0 1 0 0 0 1 0 0 0")))
-                parts.append({"mesh": (mpath, mid), "M": W, "subtype": sub,
-                              "rib": (nm[k] if k < len(nm) else "").endswith(" ceiling rib")})
-            objs.append({"oid": oid, "ident": ident, "meta": objmeta.get(oid, {}), "parts": parts})
-        plates.append({"id": pid, "name": pname, "objects": objs})
-    settings = json.loads(z.read("Metadata/project_settings.config"))
-    models_sha = hashlib.sha1(b"".join(z.read(n) for n in sorted(names) if n.startswith("3D/"))).hexdigest()
+
+
+def read_project(path: Path) -> dict:
+    with zipfile.ZipFile(path) as z:
+        names = z.namelist()
+        meshes = {}
+        sha = hashlib.sha1()
+        model_3d_raw: bytes | None = None
+        for name in sorted(names):
+            if not name.startswith("3D/"):
+                continue
+            data = z.read(name)
+            sha.update(data)
+            if name == "3D/3dmodel.model":
+                model_3d_raw = data
+            elif name.startswith("3D/Objects/") and name.endswith(".model"):
+                _parse_object_model(name, data, meshes)
+        root = ET.fromstring(model_3d_raw if model_3d_raw is not None else z.read("3D/3dmodel.model"))
+        comps, items = {}, {}
+        for obj in root.findall("c:resources/c:object", NS):
+            cl = []
+            for c in obj.findall(".//c:component", NS):
+                cl.append(((c.get(P_NS + "path") or "").replace("//", "/"), c.get("objectid"),
+                           _tr(c.get("transform") or "1 0 0 0 1 0 0 0 1 0 0 0")))
+            comps[obj.get("id")] = cl
+        for it in root.findall("c:build/c:item", NS):
+            items[it.get("objectid")] = _tr(it.get("transform") or "1 0 0 0 1 0 0 0 1 0 0 0")
+        ms = ET.fromstring(z.read("Metadata/model_settings.config"))
+        objmeta, subtypes, pnames = {}, {}, {}
+        for o in ms.findall("object"):
+            oid = o.get("id")
+            objmeta[oid] = {m.get("key"): m.get("value") for m in o.findall("metadata") if m.get("key")}
+            part_els = o.findall("part")
+            subtypes[oid] = [p.get("subtype", "normal_part") for p in part_els]
+            nm = []
+            for p in part_els:
+                el = p.find("metadata[@key='name']")
+                nm.append(el.get("value") if el is not None else "")
+            pnames[oid] = nm
+        plates = []
+        id_tr = _tr("1 0 0 0 1 0 0 0 1 0 0 0")
+        for pl in ms.findall("plate"):
+            pid = int(pl.find("metadata[@key='plater_id']").get("value"))
+            pname = pl.find("metadata[@key='plater_name']").get("value")
+            objs = []
+            for mi in pl.findall("model_instance"):
+                oid = mi.find("metadata[@key='object_id']").get("value")
+                ident = int(mi.find("metadata[@key='identify_id']").get("value"))
+                st = subtypes.get(oid) or []
+                nm = pnames.get(oid) or []
+                parts = []
+                item_tr = items.get(oid, id_tr)
+                for k, (mpath, mid, M) in enumerate(comps.get(oid, [])):
+                    sub = st[k] if k < len(st) else "normal_part"
+                    W = _compose(M, item_tr)
+                    parts.append({"mesh": (mpath, mid), "M": W, "subtype": sub,
+                                  "rib": (nm[k] if k < len(nm) else "").endswith(" ceiling rib")})
+                objs.append({"oid": oid, "ident": ident, "meta": objmeta.get(oid, {}), "parts": parts})
+            plates.append({"id": pid, "name": pname, "objects": objs})
+        settings = json.loads(z.read("Metadata/project_settings.config"))
+        has_thumbs = any(n.startswith("Metadata/plate_") and n.endswith(".png") for n in names)
     return {"path": str(path), "settings": settings, "meshes": meshes, "plates": plates,
-            "thumbnails": any(n.startswith("Metadata/plate_") and n.endswith(".png") for n in names),
-            "models_sha": models_sha}
+            "thumbnails": has_thumbs, "models_sha": sha.hexdigest()}
 
 
 def signature(V: np.ndarray, T: np.ndarray) -> str:
@@ -184,8 +238,12 @@ def signature(V: np.ndarray, T: np.ndarray) -> str:
 
 
 def models_sha(path: Path) -> str:
-    z = zipfile.ZipFile(path)
-    return hashlib.sha1(b"".join(z.read(n) for n in sorted(z.namelist()) if n.startswith("3D/"))).hexdigest()
+    sha = hashlib.sha1()
+    with zipfile.ZipFile(path) as z:
+        for n in sorted(z.namelist()):
+            if n.startswith("3D/"):
+                sha.update(z.read(n))
+    return sha.hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -224,13 +282,34 @@ def _slice_error(text: str, rc: int, log_path: Path) -> str:
         + f" (see {log_path})"
 
 
+_PLATE_LINE_RE = re.compile(r"\bplate (\d+):")
+
+
+def _remap_plate_log(text: str, new_to_orig: dict[int, int]) -> str:
+    """Rewrite ``plate <new_pid>:`` log prefixes back to original plate IDs."""
+    return _PLATE_LINE_RE.sub(
+        lambda m: f"plate {new_to_orig.get(int(m.group(1)), int(m.group(1)))}:",
+        text,
+    )
+
+
+def _can_filter_3mf(path: Path) -> bool:
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = set(z.namelist())
+            return "3D/3dmodel.model" in names and "Metadata/model_settings.config" in names
+    except (OSError, zipfile.BadZipFile):
+        return False
+
+
 def slice_plates(bambu: str, src: Path, outdir: Path, ids: list[int], log=print,
-                 timeout: int = 3600) -> tuple[dict, str, dict]:
+                 timeout: int = 3600, workers: int | None = None) -> tuple[dict, str, dict]:
     """Slice ``ids`` of a project.  The Bambu CLI stops at the first plate it
-    cannot slice (path conflict, G-code outside the bed, empty layer), so
-    every plate left without G-code is then sliced on its own.  Returns
-    ({pid: gcode path}, combined log text, {pid: error} for plates that do not
-    slice even alone)."""
+    cannot slice (path conflict, G-code outside the bed, empty layer), so any
+    plates left without G-code are batched into a filtered mini-3MF and sliced
+    together with ``--slice 0`` (falling back to bounded concurrent single-plate
+    runs if filtering is unavailable).  Returns ({pid: gcode path}, combined log
+    text, {pid: error} for plates that do not slice even alone)."""
     rc, text = slice_project(bambu, src, outdir, ids[0] if len(ids) == 1 else 0, timeout)
     g = {pid: outdir / f"plate_{pid}.gcode" for pid in ids}
     failed: dict[int, str] = {}
@@ -247,12 +326,76 @@ def slice_plates(bambu: str, src: Path, outdir: Path, ids: list[int], log=print,
         g[pid] = outdir / f"plate_{pid}.unusable"   # never analysed
     if len(ids) == 1 or not missing:
         return g, text, failed
-    log(f"verify: Bambu stopped (exit {rc}); slicing the {len(missing)} plate(s) without G-code "
-        f"one by one ...")
+
     texts = [text]
-    for pid in missing:
+    # Batch retry via filtered mini-3MF (--slice 0): avoids paying O(missing)
+    # full Bambu Studio project loads when one early plate aborts the run.
+    if len(missing) > 1 and _can_filter_3mf(Path(src)):
+        log(f"verify: Bambu stopped (exit {rc}); batch-slicing the {len(missing)} remaining "
+            f"plate(s) in a filtered project ...")
+        for attempt in range(len(missing)):
+            if len(missing) <= 1:
+                break
+            d = outdir / f"retry_batch_{attempt}"
+            d.mkdir(parents=True, exist_ok=True)
+            mini = d / "remaining.3mf"
+            try:
+                new_to_orig = slice_cache.filter_plates_3mf(src, mini, missing)
+            except (OSError, ValueError, KeyError, zipfile.BadZipFile, ET.ParseError):
+                break
+            try:
+                rc_b, t_b = slice_project(bambu, mini, d, 0, timeout)
+            finally:
+                mini.unlink(missing_ok=True)
+            remapped_log = _remap_plate_log(t_b, new_to_orig)
+            texts.append(remapped_log)
+            batch_failed: set[int] = set()
+            if rc_b != 0:
+                for m in re.finditer(r"plate (\d+): found (?:slicing result conflict|gcode unprintable)",
+                                     t_b):
+                    orig_pid = new_to_orig.get(int(m.group(1)))
+                    if orig_pid in g:
+                        failed[orig_pid] = _slice_error(remapped_log, rc_b, d / "log.txt")
+                        g[orig_pid] = outdir / f"plate_{orig_pid}.unusable"
+                        batch_failed.add(orig_pid)
+            progressed = bool(batch_failed)
+            still_missing = []
+            for new_pid, orig_pid in new_to_orig.items():
+                if orig_pid in batch_failed:
+                    continue
+                gp = d / f"plate_{new_pid}.gcode"
+                if gp.is_file():
+                    g[orig_pid] = gp
+                    progressed = True
+                else:
+                    still_missing.append(orig_pid)
+            missing = still_missing
+            if rc_b == 0 or not missing:
+                break
+            if not progressed:
+                # Failed on the first remaining plate without a standard conflict line
+                # (e.g. empty layer): mark it failed and keep batching the rest.
+                first_pid = missing.pop(0)
+                failed[first_pid] = _slice_error(remapped_log, rc_b, d / "log.txt")
+                g[first_pid] = outdir / f"plate_{first_pid}.unusable"
+
+    if not missing:
+        return g, "\n".join(texts), failed
+
+    log(f"verify: slicing {len(missing)} remaining plate(s) individually ...")
+
+    def _slice_one(pid: int):
         d = outdir / f"plate{pid}_alone"
         rc1, t1 = slice_project(bambu, src, d, pid, timeout)
+        return pid, d, rc1, t1
+
+    max_w = max(1, min(len(missing), workers or 2))
+    if max_w == 1:
+        alone_outs = [_slice_one(pid) for pid in missing]
+    else:
+        with ThreadPoolExecutor(max_workers=max_w) as ex:
+            alone_outs = list(ex.map(_slice_one, missing))
+    for pid, d, rc1, t1 in alone_outs:
         texts.append(t1)
         if (d / f"plate_{pid}.gcode").is_file() and rc1 == 0:
             g[pid] = d / f"plate_{pid}.gcode"
@@ -261,29 +404,46 @@ def slice_plates(bambu: str, src: Path, outdir: Path, ids: list[int], log=print,
     return g, "\n".join(texts), failed
 
 
+def _needs_supports_off_copy(src: Path) -> bool:
+    """Fast metadata-only check (<1 ms): False when global supports are already
+    off and no ``support_enforcer`` parts exist (so a supports-off copy would be
+    an identical slicer input)."""
+    try:
+        with zipfile.ZipFile(src) as z:
+            ps = json.loads(z.read("Metadata/project_settings.config"))
+            if str(ps.get("enable_support", "0")) != "0":
+                return True
+            ms = z.read("Metadata/model_settings.config").decode("utf-8", errors="replace")
+            if 'subtype="support_enforcer"' in ms:
+                return True
+            return False
+    except (OSError, ValueError, KeyError, zipfile.BadZipFile):
+        return True
+
+
 def supports_off_copy(src: Path, dst: Path) -> None:
     """Global supports off, and no support-enforcer volumes: with support
     disabled Bambu reports an enforced overhang as floating although the real
     file supports exactly that overhang (60470b alone: 5/5 runs flagged with
     its enforcer, 0/5 without).  Per-object enable_support stays."""
-    zin = zipfile.ZipFile(src)
-    ms = zin.read("Metadata/model_settings.config").decode()
-    enf = set(re.findall(r'<part id="(\d+)" subtype="support_enforcer"', ms))
-    with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as z:
-        for info in zin.infolist():
-            data = zin.read(info.filename)
-            if info.filename == "Metadata/project_settings.config":
-                ps = json.loads(data)
-                ps["enable_support"] = "0"
-                data = json.dumps(ps, indent=1).encode()
-            elif enf and info.filename == "Metadata/model_settings.config":
-                data = re.sub(r'\s*<part id="\d+" subtype="support_enforcer">.*?</part>', "",
-                              ms, flags=re.S).encode()
-            elif enf and info.filename == "3D/3dmodel.model":
-                data = re.sub(r'\s*<component [^>]*objectid="(\d+)"[^>]*/>',
-                              lambda m: "" if m.group(1) in enf else m.group(0),
-                              data.decode()).encode()
-            z.writestr(info, data)
+    with zipfile.ZipFile(src) as zin:
+        ms = zin.read("Metadata/model_settings.config").decode()
+        enf = set(re.findall(r'<part id="(\d+)" subtype="support_enforcer"', ms))
+        with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as z:
+            for info in zin.infolist():
+                data = zin.read(info.filename)
+                if info.filename == "Metadata/project_settings.config":
+                    ps = json.loads(data)
+                    ps["enable_support"] = "0"
+                    data = json.dumps(ps, indent=1).encode()
+                elif enf and info.filename == "Metadata/model_settings.config":
+                    data = re.sub(r'\s*<part id="\d+" subtype="support_enforcer">.*?</part>', "",
+                                  ms, flags=re.S).encode()
+                elif enf and info.filename == "3D/3dmodel.model":
+                    data = re.sub(r'\s*<component [^>]*objectid="(\d+)"[^>]*/>',
+                                  lambda m: "" if m.group(1) in enf else m.group(0),
+                                  data.decode()).encode()
+                z.writestr(info, data)
 
 
 def same_slice_input(a: Path, b: Path) -> bool:
@@ -343,7 +503,11 @@ def measure_part(loops: list[dict], height: float, has_studs: bool) -> dict:
             if abs(l["z"] - zs_top) > 1e-3:
                 continue
             P = l["pts"]
-            cal = gcode.calipers(P) + l["lw"]
+            lw = l["lw"]
+            dx, dy = np.ptp(P, 0)
+            if max(dx, dy) + lw > STUD_RANGE[1] or math.hypot(dx, dy) + lw < STUD_RANGE[0]:
+                continue
+            cal = gcode.calipers(P) + lw
             if not (STUD_RANGE[0] <= cal.max() <= STUD_RANGE[1]):
                 continue
             if gcode.circle_fit(P)[3] > 0.06:
@@ -363,25 +527,26 @@ def measure_part(loops: list[dict], height: float, has_studs: bool) -> dict:
         def size(l):
             # round loops: mean caliper (an axis-aligned bbox of a tessellated
             # circle depends on where the arc points fall)
-            if gcode.circle_fit(l["pts"])[3] < 0.03:
+            rms = gcode.circle_fit(l["pts"])[3]
+            if rms < 0.03:
                 m = float(gcode.calipers(l["pts"]).mean())
-                return m, m
+                return m, m, True
             w, h = np.ptp(l["pts"], 0)
-            return float(w), float(h)
+            return float(w), float(h), False
         if outer:
             o = max(outer, key=lambda l: np.ptp(l["pts"], 0).prod())
-            w, h = size(o)
+            w, h, _ = size(o)
             r["outer_x"], r["outer_y"] = w + o["lw"], h + o["lw"]
         cav = [l for l, d in zip(L, dep) if d == 1]
         if cav:
             c = max(cav, key=lambda l: np.ptp(l["pts"], 0).prod())
-            w, h = size(c)
+            w, h, is_round = size(c)
             # a stud socket is a rectangular (or round) hollow; the irregular
             # hollow of a wedge plate is reported separately (its bbox varies
             # ~0.02 mm even between mirrored instances in one slice)
             Q = c["pts"]
             area = 0.5 * abs(float(np.dot(Q[:, 0], np.roll(Q[:, 1], -1)) - np.dot(Q[:, 1], np.roll(Q[:, 0], -1))))
-            rect = area >= 0.97 * float(np.ptp(Q, 0).prod()) or gcode.circle_fit(Q)[3] < 0.03
+            rect = is_round or area >= 0.97 * float(np.ptp(Q, 0).prod())
             key = "cavity" if rect else "cavity_irregular"
             r[key + "_x"], r[key + "_y"] = w - c["lw"], h - c["lw"]
         tubes = [l for l, d in zip(L, dep) if d == 2 and gcode.circle_fit(l["pts"])[3] < 0.06]
@@ -392,15 +557,25 @@ def measure_part(loops: list[dict], height: float, has_studs: bool) -> dict:
     return r
 
 
-def _instances(proj: dict, plate: dict) -> list[dict]:
+def _instances(proj: dict, plate: dict, sig_cache: dict | None = None) -> list[dict]:
     """Part instances of a plate with world mesh, signature, body hull."""
     out = []
     for obj in plate["objects"]:
         for p in obj["parts"]:
-            V, T = proj["meshes"][p["mesh"]]
+            mkey = p["mesh"]
+            V, T = proj["meshes"][mkey]
             W = _apply(p["M"], V)
+            sig = None
+            if p["subtype"] == "normal_part":
+                if sig_cache is not None:
+                    sig = sig_cache.get(mkey)
+                    if sig is None:
+                        sig = signature(V, T)
+                        sig_cache[mkey] = sig
+                else:
+                    sig = signature(V, T)
             out.append({"obj": obj, "subtype": p["subtype"], "W": W, "T": T, "rib": p.get("rib", False),
-                        "sig": signature(V, T) if p["subtype"] == "normal_part" else None})
+                        "mesh_key": mkey, "M": p["M"], "sig": sig})
     return out
 
 
@@ -473,9 +648,39 @@ def enclosed_support(P: list[dict], layer_tol: float = ENCLOSED_LAYER_TOL) -> li
     return sorted(hits.values(), key=lambda h: (h["bbox"], h["z"]))
 
 
-def analyse_plate(proj: dict, plate: dict, gpath: Path) -> dict:
-    P = gcode.paths(gpath)
-    insts = _instances(proj, plate)
+def _assign_paths_to_instances(paths_list: list[dict], normal: list[dict], tol: float = 0.6,
+                               chunk: int = 2048) -> dict[int, list[dict]]:
+    """Vectorised bbox containment matching: returns ``{inst_idx: [paths]}``,
+    picking the first instance whose expanded bbox contains each path."""
+    per: dict[int, list[dict]] = defaultdict(list)
+    if not paths_list or not normal:
+        return per
+    L0 = np.array([p["pts"].min(0) for p in paths_list], dtype=np.float64)
+    L1 = np.array([p["pts"].max(0) for p in paths_list], dtype=np.float64)
+    G0 = np.array([i["g_min"] - tol for i in normal], dtype=np.float64)
+    G1 = np.array([i["g_max"] + tol for i in normal], dtype=np.float64)
+    g0x, g0y = G0[None, :, 0], G0[None, :, 1]
+    g1x, g1y = G1[None, :, 0], G1[None, :, 1]
+    for s in range(0, len(paths_list), chunk):
+        l0 = L0[s:s + chunk]
+        l1 = L1[s:s + chunk]
+        m = ((l0[:, 0:1] >= g0x) & (l0[:, 1:2] >= g0y)
+             & (l1[:, 0:1] <= g1x) & (l1[:, 1:2] <= g1y))
+        has = m.any(axis=1)
+        if not has.any():
+            continue
+        first = m.argmax(axis=1)
+        for idx in np.flatnonzero(has):
+            per[int(first[idx])].append(paths_list[s + int(idx)])
+    return per
+
+
+def analyse_plate(proj: dict, plate: dict, gpath: Path,
+                  stud_cache: dict | None = None,
+                  sig_cache: dict | None = None,
+                  cache_lock: threading.Lock | None = None) -> dict:
+    P = gcode.paths(gpath, features=ANALYSE_FEATURES)
+    insts = _instances(proj, plate, sig_cache=sig_cache)
     normal = [i for i in insts if i["subtype"] == "normal_part" and not i["rib"]]
     enf = [i for i in insts if i["subtype"] == "support_enforcer"]
     # G-code offset: one per plate (outer-wall bbox vs world bbox of all its
@@ -494,20 +699,26 @@ def analyse_plate(proj: dict, plate: dict, gpath: Path) -> dict:
     for i in insts:
         i["g_min"] = i["W"].min(0)[:2] + off
         i["g_max"] = i["W"].max(0)[:2] + off
-    # assign closed outer-wall loops to part instances
-    per = defaultdict(list)
-    for p in walls:
-        if not gcode.is_closed(p["pts"]):
-            continue
-        lo, hi = p["pts"].min(0), p["pts"].max(0)
-        for k, i in enumerate(normal):
-            if (lo >= i["g_min"] - 0.6).all() and (hi <= i["g_max"] + 0.6).all():
-                per[k].append(p)
-                break
+    # assign closed outer-wall loops to part instances (vectorised)
+    closed_walls = [p for p in walls if gcode.is_closed(p["pts"])]
+    per = _assign_paths_to_instances(closed_walls, normal)
     parts = []
+    local_studs = stud_cache if stud_cache is not None else {}
     for k, i in enumerate(normal):
-        Wl = i["W"] - i["W"].min(0)
-        has_studs = bool(features.stud_rings(Wl, i["T"]))
+        skey = (i["mesh_key"], np.round(i["M"][:3, :3], 6).tobytes())
+        if cache_lock is not None:
+            with cache_lock:
+                has_studs = local_studs.get(skey)
+        else:
+            has_studs = local_studs.get(skey)
+        if has_studs is None:
+            Wl = i["W"] - i["W"].min(0)
+            has_studs = bool(features.stud_rings(Wl, i["T"]))
+            if cache_lock is not None:
+                with cache_lock:
+                    local_studs[skey] = has_studs
+            else:
+                local_studs[skey] = has_studs
         m = measure_part(per.get(k, []), float(np.ptp(i["W"][:, 2])), has_studs)
         parts.append({"sig": i["sig"], "object": i["obj"]["meta"].get("name", i["obj"]["oid"]),
                       "at": [round(float(x), 1) for x in i["g_min"]], **m})
@@ -543,24 +754,27 @@ def analyse_plate(proj: dict, plate: dict, gpath: Path) -> dict:
             h["sig"] = owner["sig"] if owner else None
         support["inside_bodies"] = sum(h["n"] for h in enc)
         support["enclosed"] = enc[:200]
-    # bridge directions per signature
+    # bridge directions per signature (vectorised assignment, hoisted bbox)
     bridges = defaultdict(lambda: defaultdict(float))
-    for p in P:
-        if p["feat"] != "Bridge":
-            continue
-        lo = p["pts"].min(0)
-        for k, i in enumerate(normal):
-            if (lo >= i["g_min"] - 0.6).all() and (p["pts"].max(0) <= i["g_max"] + 0.6).all():
-                d = np.diff(p["pts"], axis=0)
-                L = np.hypot(d[:, 0], d[:, 1])
-                ang = np.round(np.degrees(np.arctan2(d[:, 1], d[:, 0])) % 180).astype(int) % 180
-                for a, l in zip(ang, L):
-                    if l > 1:
-                        bridges[i["sig"]][int(a)] += float(l)
-                break
+    bridge_paths = [p for p in P if p["feat"] == "Bridge"]
+    per_bridge = _assign_paths_to_instances(bridge_paths, normal)
+    for k, plist in per_bridge.items():
+        sig = normal[k]["sig"]
+        for p in plist:
+            d = np.diff(p["pts"], axis=0)
+            L = np.hypot(d[:, 0], d[:, 1])
+            mask = L > 1
+            if not mask.any():
+                continue
+            ang = np.round(np.degrees(np.arctan2(d[mask, 1], d[mask, 0])) % 180).astype(int) % 180
+            for a, l in zip(ang, L[mask]):
+                bridges[sig][int(a)] += float(l)
     return {"parts": parts, "support": support,
             "bridges": {s: {a: round(l, 1) for a, l in sorted(v.items()) if l > 5}
                         for s, v in bridges.items()}}
+
+
+_ORIG_ANALYSE_PLATE = analyse_plate
 
 
 def aggregate(parts: list[dict]) -> dict:
@@ -699,23 +913,108 @@ def enclosure_issue(pid: int, sup: dict, legacy: bool | None) -> tuple[str, str]
     return "error", msg
 
 
+_WARN_RE = re.compile(r"plate (\d+): found (?:NON_CRITICAL )?slicing warnings: (.*)")
+
+
+def _slice_with_cache(
+    bambu: str,
+    proj_path: Path,
+    outdir: Path,
+    ids: list[int],
+    *,
+    gcode_cache: Path | None,
+    log=print,
+) -> tuple[dict, str, dict]:
+    """Slice ``ids`` of ``proj_path``, consulting and populating the shared
+    per-plate G-code cache when ``gcode_cache`` is provided."""
+    if gcode_cache is None or not _can_filter_3mf(proj_path):
+        return slice_plates(bambu, proj_path, outdir, ids, log=log)
+
+    bver = slice_cache.bambu_version_for(bambu)
+    try:
+        pkeys = slice_cache.plate_keys(proj_path, bver)
+    except (OSError, ValueError, KeyError, zipfile.BadZipFile, ET.ParseError):
+        return slice_plates(bambu, proj_path, outdir, ids, log=log)
+
+    g: dict[int, Path] = {}
+    cached_lines: list[str] = []
+    missed: list[int] = []
+    for pid in ids:
+        pk = pkeys.get(pid)
+        hit = slice_cache.get(gcode_cache, pk) if pk else None
+        if hit is not None:
+            g[pid] = hit["gcode"]
+            for w in hit["warnings"]:
+                cached_lines.append(f"plate {pid}: found slicing warnings: {w}")
+        else:
+            missed.append(pid)
+
+    if not missed:
+        log(f"verify: G-code cache hit for all {len(ids)} plate(s) of {proj_path.name}")
+        return g, "\n".join(cached_lines), {}
+
+    if len(missed) < len(ids):
+        log(f"verify: G-code cache hit {len(ids) - len(missed)}/{len(ids)} plate(s); "
+            f"slicing {len(missed)} remaining plate(s) ...")
+        outdir.mkdir(parents=True, exist_ok=True)
+        mini = outdir / "missed.3mf"
+        new_to_orig = slice_cache.filter_plates_3mf(proj_path, mini, missed)
+        try:
+            g_m, text_m, failed_m = slice_plates(bambu, mini, outdir, list(new_to_orig), log=log)
+        finally:
+            mini.unlink(missing_ok=True)
+        text_remapped = _remap_plate_log(text_m, new_to_orig)
+        failed = {new_to_orig.get(k, k): v for k, v in failed_m.items()}
+        new_g = {new_to_orig.get(k, k): v for k, v in g_m.items()}
+    else:
+        new_g, text_remapped, failed = slice_plates(bambu, proj_path, outdir, ids, log=log)
+
+    # Extract per-plate warnings and populate the shared cache for clean plates
+    warns_by_pid: dict[int, list[str]] = defaultdict(list)
+    for m in _WARN_RE.finditer(text_remapped):
+        pid, msg = int(m.group(1)), m.group(2).strip()
+        if msg and msg not in warns_by_pid[pid]:
+            warns_by_pid[pid].append(msg)
+
+    for pid, gpath in new_g.items():
+        g[pid] = gpath
+        if pid in failed or pid not in pkeys:
+            continue
+        gp = Path(gpath)
+        if gp.is_file() and gp.stat().st_size > 0:
+            slice_cache.put(
+                gcode_cache, pkeys[pid], gp,
+                bambu_version=bver,
+                warnings=warns_by_pid.get(pid, []),
+                source="brickprint.verify",
+            )
+
+    parts_text = cached_lines + ([text_remapped] if text_remapped else [])
+    return g, "\n".join(parts_text), failed
+
+
 def run(path: Path, bambu: str, plates: list[int] | None = None, reference: Path | None = None,
         tol: float = 0.01, workdir: Path | None = None, float_check: bool = True,
         expected: dict | None = None, log=print, legacy: bool | None = None,
-        concurrent: bool = True) -> dict:
+        concurrent: bool = True, gcode_cache: Path | None = None) -> dict:
     """``legacy``: the build used the default profile (no socket blockers);
     None reads it from the sibling ``_report.json`` (no report: strict).
 
     Floating check: one supports-off Bambu run.  When the supports-off copy
     is the same slicer input as the file (global supports already off, no
     enforcers: default-profile builds), that run is the file's own slice and
-    no second slice is made (the old code sliced the same project twice and
-    read the floating warnings of one run only, so the verdict is drawn the
-    same way).  Otherwise the copy is sliced while the file's plates are
-    sliced and analysed (``concurrent``; False: one after the other)."""
+    no second slice is made.  Otherwise the copy is sliced while the file's
+    plates are sliced and analysed (``concurrent``; False: one after the other).
+    When ``gcode_cache`` is given, per-plate G-code and warnings are reused from
+    and saved to the shared content-addressed cache."""
     path = Path(path)
+    rep = _sibling_report(path)
     if legacy is None:
-        legacy = build_is_legacy(path)
+        if rep is None:
+            legacy = None
+        else:
+            s = rep.get("settings")
+            legacy = True if not s else (bool(s.get("legacy_default")) if isinstance(s, dict) else None)
     # G-code is large: default to a temp dir (kept; its path is in the report)
     work = Path(workdir or tempfile.mkdtemp(prefix="brickprint_verify_"))
     work.mkdir(parents=True, exist_ok=True)
@@ -727,35 +1026,53 @@ def run(path: Path, bambu: str, plates: list[int] | None = None, reference: Path
     errors, warnings = [], []
     result = {"file": str(path), "workdir": str(work), "plates": {}}
 
-    def sliced(proj_path: Path, tag: str) -> tuple[dict, str, dict]:
-        g, text, failed = slice_plates(bambu, proj_path, work / tag, ids, log=log)
-        return g, text, failed
+    def sliced(proj_path: Path, tag: str, slice_ids: list[int] | None = None) -> tuple[dict, str, dict]:
+        return _slice_with_cache(
+            bambu, proj_path, work / tag,
+            ids if slice_ids is None else slice_ids,
+            gcode_cache=gcode_cache, log=log,
+        )
 
-    off, off_same, fut_off, pool = None, False, None, None
+    off, off_same, fut_off, fut_ref, pool = None, False, None, None, None
+    ref_proj, rids = None, []
+    if reference:
+        ref_proj = read_project(Path(reference))
+        rids = [p["id"] for p in ref_proj["plates"]]
+
     if float_check:
-        off = work / "supports_off.3mf"
-        supports_off_copy(path, off)
-        off_same = same_slice_input(path, off)
-        if off_same:
-            off.unlink(missing_ok=True)
-        elif concurrent:
-            pool = ThreadPoolExecutor(max_workers=1)
-            fut_off = pool.submit(sliced, off, "supports_off")
+        if not _needs_supports_off_copy(path):
+            off_same = True
+        else:
+            off = work / "supports_off.3mf"
+            supports_off_copy(path, off)
+            off_same = same_slice_input(path, off)
+            if off_same:
+                off.unlink(missing_ok=True)
         result["float_check"] = {
             "slice": "new" if off_same else "supports_off",
             "note": ("supports-off copy identical to the file (global supports off, no "
                      "enforcers): floating warnings read from the file's own slice")
             if off_same else "supports-off copy sliced" + (" concurrently" if concurrent else "")}
+
+    bg_jobs = (1 if (float_check and not off_same) else 0) + (1 if reference else 0)
+    if concurrent and bg_jobs > 0:
+        pool = ThreadPoolExecutor(max_workers=1)
+        if float_check and not off_same:
+            fut_off = pool.submit(sliced, off, "supports_off")
+        if reference:
+            fut_ref = pool.submit(sliced, Path(reference), "reference", rids)
     try:
-        return _run_checks(path, bambu, proj, ids, reference, tol, work, float_check, expected,
-                           log, legacy, result, errors, warnings, sliced, off, off_same, fut_off)
+        return _run_checks(path, bambu, proj, ids, reference, ref_proj, rids, tol, work,
+                           float_check, expected, log, legacy, rep, result, errors, warnings,
+                           sliced, off, off_same, fut_off, fut_ref, concurrent)
     finally:
         if pool is not None:
             pool.shutdown(wait=True)
 
 
-def _run_checks(path, bambu, proj, ids, reference, tol, work, float_check, expected, log, legacy,
-                result, errors, warnings, sliced, off, off_same, fut_off) -> dict:
+def _run_checks(path, bambu, proj, ids, reference, ref_proj, rids, tol, work, float_check,
+                expected, log, legacy, rep, result, errors, warnings, sliced, off, off_same,
+                fut_off, fut_ref, concurrent) -> dict:
     if float_check and off_same:
         log(f"verify: slicing {path.name} plates {ids} (its supports-off copy is the same "
             f"project: one slice serves both checks) ...")
@@ -766,28 +1083,48 @@ def _run_checks(path, bambu, proj, ids, reference, tol, work, float_check, expec
     gfiles, text, failed = sliced(path, "new")
     for pid, why in sorted(failed.items()):
         errors.append(f"plate {pid}: Bambu could not slice it: {why}")
-    for pid in ids:
+
+    plates_by_id = {p["id"]: p for p in proj["plates"]}
+    stud_cache: dict = {}
+    sig_cache: dict = {}
+    cache_lock = threading.Lock()
+
+    def _check_one_plate(pid: int):
         g = gfiles[pid]
         if not g.is_file():
-            if pid not in failed:
-                errors.append(f"plate {pid}: no G-code")
-            continue
+            return pid, ([f"plate {pid}: no G-code"] if pid not in failed else []), [], None
         cfgb = gcode.config_block(g)
-        eff = check_effective(proj["settings"], cfgb)
-        errors += [f"plate {pid}: effective setting mismatch: {e}" for e in eff]
+        p_errs = [f"plate {pid}: effective setting mismatch: {e}"
+                  for e in check_effective(proj["settings"], cfgb)]
         if expected:
-            errors += [f"plate {pid}: intended setting not effective: {e}"
+            p_errs += [f"plate {pid}: intended setting not effective: {e}"
                        for e in check_expected(expected, cfgb)]
-        plate = next(p for p in proj["plates"] if p["id"] == pid)
-        an = analyse_plate(proj, plate, g)
+        plate = plates_by_id[pid]
+        an = analyse_plate(proj, plate, g) if analyse_plate is not _ORIG_ANALYSE_PLATE else \
+            analyse_plate(proj, plate, g, stud_cache=stud_cache, sig_cache=sig_cache,
+                          cache_lock=cache_lock)
         sup = an["support"]
         if sup["outside_enforcers"]:
-            errors.append(f"plate {pid}: {sup['outside_enforcers']} support points outside enforcer boxes")
+            p_errs.append(f"plate {pid}: {sup['outside_enforcers']} support points outside enforcer boxes")
+        p_warns = []
         enc = enclosure_issue(pid, sup, legacy)
         if enc:
-            (warnings if enc[0] == "warning" else errors).append(enc[1])
-        result["plates"][pid] = {"name": plate["name"], "config": cfgb, **an,
-                                 "fit": aggregate(an["parts"])}
+            (p_warns if enc[0] == "warning" else p_errs).append(enc[1])
+        rec = {"name": plate["name"], "config": cfgb, **an, "fit": aggregate(an["parts"])}
+        return pid, p_errs, p_warns, rec
+
+    if concurrent and len(ids) > 1:
+        with ThreadPoolExecutor(max_workers=min(4, len(ids))) as apool:
+            plate_outs = list(apool.map(_check_one_plate, ids))
+    else:
+        plate_outs = [_check_one_plate(pid) for pid in ids]
+
+    for pid, p_errs, p_warns, rec in plate_outs:
+        errors.extend(p_errs)
+        warnings.extend(p_warns)
+        if rec is not None:
+            result["plates"][pid] = rec
+
     if float_check:
         if off_same:
             text_off = text
@@ -795,11 +1132,11 @@ def _run_checks(path, bambu, proj, ids, reference, tol, work, float_check, expec
             _, text_off, _ = fut_off.result()
         else:
             _, text_off, _ = sliced(off, "supports_off")
-        for m in re.finditer(r"plate (\d+): found (?:NON_CRITICAL )?slicing warnings: (.*)", text_off):
+        for m in _WARN_RE.finditer(text_off):
             pid, msg = int(m.group(1)), m.group(2)
             if pid not in ids or not ("floating" in msg or "empty layer" in msg):
                 continue
-            plate = next(p for p in proj["plates"] if p["id"] == pid)
+            plate = plates_by_id[pid]
             named = re.search(r"It seems object (.+?) has floating", msg)
             supp = [o for o in plate["objects"] if o["meta"].get("enable_support") == "1"]
             if named:   # Bambu names the object: only its own supports count
@@ -810,7 +1147,6 @@ def _run_checks(path, bambu, proj, ids, reference, tol, work, float_check, expec
                 errors.append(f"plate {pid}: floating with supports off and no per-object "
                               f"supports: {msg[:120]}")
     # thumbnails
-    rep = _sibling_report(path)
     if proj["thumbnails"] and rep is not None:
         want = rep.get("normalised_models_sha")
         if want and want != proj["models_sha"]:
@@ -819,23 +1155,28 @@ def _run_checks(path, bambu, proj, ids, reference, tol, work, float_check, expec
         warnings.append("no plate thumbnails (raw project; build with --bambu to add them)")
 
     if reference:
-        ref = read_project(Path(reference))
-        rids = [p["id"] for p in ref["plates"]]
-        log(f"verify: slicing reference {Path(reference).name} ...")
-        rout = work / "reference"
-        rc2, _ = slice_project(bambu, Path(reference), rout, 0 if len(rids) > 1 else rids[0])
+        ref = ref_proj
+        if fut_ref is not None:
+            rgfiles, _, _ = fut_ref.result()
+        else:
+            log(f"verify: slicing reference {Path(reference).name} ...")
+            rgfiles, _, _ = sliced(Path(reference), "reference", rids)
+        ref_plates_by_id = {p["id"]: p for p in ref["plates"]}
+        ref_stud_cache: dict = {}
+        ref_sig_cache: dict = {}
         ref_fit, ref_cfg = {}, None
         for pid in rids:
-            g = rout / f"plate_{pid}.gcode"
-            if not g.is_file():
+            g = rgfiles.get(pid, work / "reference" / f"plate_{pid}.gcode")
+            if not Path(g).is_file():
                 errors.append(f"reference plate {pid}: no G-code")
                 continue
-            plate = next(p for p in ref["plates"] if p["id"] == pid)
-            an = analyse_plate(ref, plate, g)
+            plate = ref_plates_by_id[pid]
+            an = analyse_plate(ref, plate, Path(g)) if analyse_plate is not _ORIG_ANALYSE_PLATE else \
+                analyse_plate(ref, plate, Path(g), stud_cache=ref_stud_cache, sig_cache=ref_sig_cache)
             for sig, m in aggregate(an["parts"]).items():
                 ref_fit.setdefault(sig, []).append(m)
             if ref_cfg is None:
-                ref_cfg = gcode.config_block(g)
+                ref_cfg = gcode.config_block(Path(g))
         new_fit = {}
         for pid, pr in result["plates"].items():
             for sig, m in pr["fit"].items():

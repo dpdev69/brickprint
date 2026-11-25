@@ -10,8 +10,13 @@ names it reproduces ``assets/a1mini_pla_project_settings.json`` byte for byte
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
+import os
+import platform
 import plistlib
+import threading
 from functools import lru_cache
 from pathlib import Path
 
@@ -217,21 +222,91 @@ def bbl_dir(app: Path) -> Path:
     return Path(app) / "Contents" / "Resources" / "profiles" / "BBL"
 
 
-def app_version(app: Path) -> str:
-    return plistlib.loads((Path(app) / "Contents" / "Info.plist").read_bytes())[
+@lru_cache(maxsize=32)
+def _cached_app_version(app_str: str) -> str:
+    return plistlib.loads((Path(app_str) / "Contents" / "Info.plist").read_bytes())[
         "CFBundleShortVersionString"]
+
+
+def app_version(app: Path) -> str:
+    return _cached_app_version(str(Path(app)))
+
+
+def _index_cache_dir() -> Path:
+    env = os.environ.get("BRICKPRINT_CACHE", "").strip()
+    if env:
+        base = Path(env).expanduser()
+    elif platform.system() == "Darwin":
+        base = Path.home() / "Library" / "Caches" / "brickprint"
+    else:
+        xdg = os.environ.get("XDG_CACHE_HOME", "").strip()
+        base = (Path(xdg).expanduser() if xdg else Path.home() / ".cache") / "brickprint"
+    return base / "profile_index"
+
+
+def _index_cache_path(bbl: str, kind: str) -> Path:
+    h = hashlib.sha1(f"{bbl}\0{kind}".encode("utf-8")).hexdigest()[:16]
+    return _index_cache_dir() / f"v1_{kind}_{h}.json"
+
+
+def _dir_sig(root: Path) -> list[tuple[str, int]]:
+    """Fast mtime signature of ``root`` and its immediate subdirectories."""
+    sig: list[tuple[str, int]] = []
+    try:
+        sig.append((".", root.stat().st_mtime_ns))
+        with os.scandir(root) as it:
+            for e in sorted(it, key=lambda x: x.name):
+                if e.is_dir(follow_symlinks=False):
+                    try:
+                        sig.append((e.name, e.stat(follow_symlinks=False).st_mtime_ns))
+                    except OSError:
+                        pass
+    except OSError:
+        pass
+    return sig
 
 
 @lru_cache(maxsize=None)
 def _index(bbl: str, kind: str) -> dict:
-    idx = {}
-    for p in (Path(bbl) / kind).rglob("*.json"):
+    root = Path(bbl) / kind
+    sig = _dir_sig(root)
+    cpath = _index_cache_path(bbl, kind)
+    if sig and cpath.is_file():
         try:
-            name = json.loads(p.read_text()).get("name")
-        except (ValueError, UnicodeDecodeError):
-            continue
-        if name:
-            idx[name] = p
+            cached = json.loads(cpath.read_text(encoding="utf-8"))
+            if (isinstance(cached, dict) and cached.get("bbl") == bbl
+                    and cached.get("kind") == kind and cached.get("sig") == [list(x) for x in sig]
+                    and isinstance(cached.get("entries"), dict)):
+                idx = {name: root / rel for name, rel in cached["entries"].items()}
+                # Spot-check that the index isn't stale
+                if not idx or next(iter(idx.values())).is_file():
+                    return idx
+        except (OSError, ValueError, TypeError):
+            pass
+
+    idx = {}
+    rels = {}
+    if root.is_dir():
+        for p in root.rglob("*.json"):
+            try:
+                name = json.loads(p.read_text()).get("name")
+            except (ValueError, UnicodeDecodeError, OSError):
+                continue
+            if name:
+                idx[name] = p
+                try:
+                    rels[name] = p.relative_to(root).as_posix()
+                except ValueError:
+                    rels[name] = str(p)
+    if sig and rels:
+        try:
+            cpath.parent.mkdir(parents=True, exist_ok=True)
+            tmp = cpath.with_name(f".{cpath.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+            payload = {"bbl": bbl, "kind": kind, "sig": [list(x) for x in sig], "entries": rels}
+            tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+            os.replace(tmp, cpath)
+        except OSError:
+            pass
     return idx
 
 
@@ -239,10 +314,23 @@ def index_profiles(bbl: Path, kind: str) -> dict:
     return _index(str(bbl), kind)
 
 
+@lru_cache(maxsize=1024)
+def _read_json_cached(path_str: str, mtime_ns: int) -> dict:
+    return json.loads(Path(path_str).read_text())
+
+
+def _load_preset_file(p: Path) -> dict:
+    try:
+        mtime = p.stat().st_mtime_ns
+    except OSError:
+        return json.loads(p.read_text())
+    return _read_json_cached(str(p), mtime)
+
+
 def resolve(idx: dict, name: str) -> dict:
     if name not in idx:
         raise SystemExit(f"Bambu preset not found: {name!r}")
-    data = json.loads(idx[name].read_text())
+    data = _load_preset_file(idx[name])
     out: dict = {}
     if data.get("inherits"):
         out.update(resolve(idx, data["inherits"]))
@@ -252,29 +340,34 @@ def resolve(idx: dict, name: str) -> dict:
     return out
 
 
+@lru_cache(maxsize=256)
+def _resolved_chain_cached(bbl: str, kind: str, name: str) -> dict:
+    return resolve(_index(bbl, kind), name)
+
+
 def chain(app: Path, kind: str, name: str) -> dict:
     """Resolved preset values without bookkeeping keys."""
-    full = resolve(index_profiles(bbl_dir(app), kind), name)
-    return {k: v for k, v in full.items() if k not in META}
+    full = _resolved_chain_cached(str(bbl_dir(app)), kind, name)
+    return {k: (list(v) if isinstance(v, list) else v) for k, v in full.items() if k not in META}
 
 
 def raw_chain(app: Path, kind: str, name: str) -> dict:
-    return resolve(index_profiles(bbl_dir(app), kind), name)
+    return copy.deepcopy(_resolved_chain_cached(str(bbl_dir(app)), kind, name))
 
 
 def build_template(app: Path, machine: str = MACHINE, process: str = PROCESS,
                    filament: str = FILAMENT, overrides: dict | None = None) -> dict:
     """One-slot project settings for the given stock chain (see module doc)."""
-    bbl = bbl_dir(app)
-    m = resolve(index_profiles(bbl, "machine"), machine)
-    f = resolve(index_profiles(bbl, "filament"), filament)
-    p = resolve(index_profiles(bbl, "process"), process)
-    settings = json.loads(json.dumps(PROJECT_DEFAULTS))
+    bbl = str(bbl_dir(app))
+    m = _resolved_chain_cached(bbl, "machine", machine)
+    f = _resolved_chain_cached(bbl, "filament", filament)
+    p = _resolved_chain_cached(bbl, "process", process)
+    settings = {k: (list(v) if isinstance(v, list) else v) for k, v in PROJECT_DEFAULTS.items()}
     stock: dict = {}
     for ch in (m, p, f):          # filament last: it owns shared keys
         for k, v in ch.items():
             if k not in META:
-                stock[k] = v
+                stock[k] = list(v) if isinstance(v, list) else v
     settings.update(stock)
     settings.update(OVERRIDES if overrides is None else overrides)
     settings.update({

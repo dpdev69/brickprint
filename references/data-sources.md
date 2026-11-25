@@ -5,7 +5,8 @@
 Download page: <https://rebrickable.com/downloads/>
 
 The tool downloads these gzip CSV files into
-`~/Library/Caches/brickprint/rebrickable/`:
+`~/Library/Caches/brickprint/rebrickable/` (Linux:
+`${XDG_CACHE_HOME:-~/.cache}/brickprint/rebrickable/`):
 
 | file | use |
 |---|---|
@@ -50,11 +51,23 @@ parent directory of the skill, if one exists). Otherwise set `ldview` in
 
 ## Bambu Studio
 
-Optional. Used only for the final thumbnail/normalisation pass:
+**Required for reliable floating-part orientation, `verify`, and non-A1-mini
+printer presets (`--preset a1|p1s|x1c`).** The Bambu Studio CLI is used for:
+
+- the per-part floating probe, final-geometry check, and whole-project plate
+  check during `build`;
+- live resolution of stock printer/process/filament preset chains (tuned
+  profiles, non-A1-mini `--preset` templates, and `profiles regen-template`);
+- `brickprint verify` (slicer-level verification);
+- the `--bambu` thumbnail/normalisation pass:
 
 ```
 BambuStudio project_raw.3mf --outputdir <writable-dir> --export-3mf project.3mf
 ```
 
-The raw 3MF is valid without this pass. The CLI export works while the Bambu
-Studio GUI is open (CLI-verified), so there is no need to close it.
+Without Bambu Studio, default A1 mini builds still run using the bundled
+snapshot and numpy orientation emulator only, printing an `UNVERIFIED` floating
+warning (the raw 3MF is valid, without plate thumbnails); non-A1-mini presets
+stop unless a template is supplied via `settings` / `BRICKPRINT_SETTINGS`. The
+CLI works while the Bambu Studio GUI is open (CLI-verified), so there is no
+need to close it.

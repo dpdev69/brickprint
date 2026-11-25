@@ -133,27 +133,30 @@ the real slicer on dozens of poses per set, so `build` asks Bambu Studio:
    re-runs are instant and only changed meshes are re-probed;
 6. `orient.choose()` gets the verdicts; they outrank the emulator, and
    `needs_support` means Bambu itself flags the chosen pose;
-7. ceiling ribs (`--ceilings recipe8`) are new geometry the probe never saw:
-   every rib part is sliced as written (2 runs, `probe.check_final`, cached
-   by final mesh + per-part settings); a part that floats with its ribs and
-   is clean without them in 3 runs loses its ribs (`ribs_dropped` in
-   `_report.json` → `features.ceiling_parts`). Countach: 70490's ribs under
-   its 11.2 mm dome ceiling were a "floating cantilever" in 5/5 runs, 0/5
-   without;
+7. ceiling ribs and final-geometry check (`--ceilings recipe8` / profile
+   builds): every rib part is sliced as written (`probe.CONFIRM_RUNS` = 3 runs
+   via `probe.check_final`, cached by final mesh + per-part settings); a part
+   that floats with its ribs and is clean without them in 3 runs loses its ribs
+   (`ribs_dropped` in `_report.json` → `features.ceiling_parts`). Countach:
+   70490's ribs under its 11.2 mm dome ceiling were a "floating cantilever" in
+   5/5 runs, 0/5 without. All remaining non-support part types are then
+   screened as built (`_screen_final`, 3 runs, cached); any part type flagged
+   in any run moves to the support plates before packing;
 8. plate check: after packing, the whole raw 3MF (profile builds: the
    supports-off verdict copy) is sliced twice (`plate_check_runs`, in
    parallel). Bambu writes one `found slicing warnings` line **per floating
    object**; all of them are collected. On a one-object plate (default
-   profile) a flagged plate gets the support-plate overrides as a whole
-   (`supports = slice-check`). On plates with one object per part (or per
-   colour), only the named objects get per-object `tree(auto)` +
-   `bridge_no_support` (profile builds also get socket blockers, see
-   `print-tuning.md`), and the flagged plates are re-checked, up to 4
-   rounds, until no new object is named (`slice-check: 15068 #1; ...` in
-   `_plates.csv`). An empty layer is reported as an error. A plate Bambu
-   cannot slice no longer hides the plates after it: they are sliced one by
-   one and the failure is reported. Cached in `plate_checks.json` by
-   project content.
+   profile), or a colour-object mixed plate where a single part stem cannot be
+   resolved, a flagged plate gets the support-plate overrides as a whole
+   (`supports = slice-check` in `_plates.csv`). On plates with one object per
+   part (`ceilings recipe8`), each named part type gets `needs_support = True`,
+   is moved to the support plates (with tree supports and socket blockers, see
+   `print-tuning.md`), and the project is re-packed and re-checked, up to 4
+   rounds (`PLATE_CHECK_ROUNDS`), until no new part type is flagged (recorded
+   in `_report.json` → `plate_check.moved_to_support_plates`). An empty layer
+   is reported as an error. A plate Bambu cannot slice no longer hides the
+   plates after it: remaining plates are still sliced and the failure is
+   reported. Cached by plate/project content.
 
 The probe and the whole-project plate check always slice with supports **off**
 (a "verdict copy"; Bambu hides floating warnings when supports are on, even
@@ -251,6 +254,6 @@ files + component transforms (4×3 row-major matrices) and checks:
 - max x/y ≤ bed/depth
 - min z ≈ 0
 
-It also reports component and triangle counts and writes
-`orientation_warnings` for parts that still have small bed contact after
-auto-orientation. It does not slice.
+It also reports plate, component, and triangle counts. It does not slice and
+does not compute `orientation_warnings` (`build` writes `orientation_warnings`
+to `_report.json` for tall, small-contact parts).
