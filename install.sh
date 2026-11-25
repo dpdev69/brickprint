@@ -1,43 +1,82 @@
 #!/usr/bin/env bash
-# Install brickprint as a global skill for Codex and Claude.
-#
-#   ./install.sh          copy
-#   ./install.sh --link   symlink (development)
-#   ./install.sh -h       help
-#
-# Environment overrides (all optional):
-#   BRICKPRINT_CONFIG   config file to write (default ~/.config/brickprint/config.json,
-#                       the same path brickprint/config.py reads)
-#   BRICKPRINT_CACHE    cache dir written into the config
-#   BRICKPRINT_LDRAW    LDraw library folder (the one holding LDConfig.ldr)
-#   BRICKPRINT_LDVIEW   LDView executable
-#   BRICKPRINT_BAMBU    Bambu Studio executable
-#   BRICKPRINT_OS       pretend `uname -s` returned this (for testing: Darwin / Linux)
-#
+# Install brickprint as a global skill for Antigravity, Codex, and Claude Code.
 # Compatible with bash 3.2 (macOS /bin/bash).
 set -euo pipefail
 
 usage() {
-    sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    cat <<'EOF'
+Install brickprint as a global skill for Antigravity, Codex, and Claude Code.
+
+Usage:
+  ./install.sh [options]
+
+Options:
+  --link               symlink into skill directories instead of copying (development)
+  --keep-backups N     number of brickprint.* backup dirs to keep (default: 6; 0 = keep all)
+  -h, --help           show this help
+
+Targets:
+  ~/.gemini/config/skills/brickprint   (Antigravity)
+  ~/.codex/skills/brickprint           (Codex)
+  ~/.claude/skills/brickprint          (Claude Code)
+
+Environment overrides (all optional):
+  BRICKPRINT_CONFIG       config file to write (default ~/.config/brickprint/config.json)
+  BRICKPRINT_CACHE        cache dir written into the config
+  BRICKPRINT_LDRAW        LDraw library folder (the one holding LDConfig.ldr)
+  BRICKPRINT_LDVIEW       LDView executable
+  BRICKPRINT_BAMBU        Bambu Studio executable
+  BRICKPRINT_OS           pretend `uname -s` returned this (for testing: Darwin / Linux)
+  BRICKPRINT_KEEP_BACKUPS default for --keep-backups (default: 6)
+EOF
 }
 
 MODE="copy"
-case "${1:-}" in
-    "") ;;
-    --link) MODE="link" ;;
-    -h|--help) usage; exit 0 ;;
-    *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
-esac
+KEEP_BACKUPS="${BRICKPRINT_KEEP_BACKUPS:-6}"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --link)
+            MODE="link"
+            shift
+            ;;
+        --keep-backups)
+            if [[ $# -lt 2 ]] || ! [[ "$2" =~ ^[0-9]+$ ]]; then
+                echo "--keep-backups requires a non-negative integer" >&2
+                exit 2
+            fi
+            KEEP_BACKUPS="$2"
+            shift 2
+            ;;
+        --keep-backups=*)
+            KEEP_BACKUPS="${1#*=}"
+            if ! [[ "$KEEP_BACKUPS" =~ ^[0-9]+$ ]]; then
+                echo "--keep-backups requires a non-negative integer" >&2
+                exit 2
+            fi
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "unknown option: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OS="${BRICKPRINT_OS:-$(uname -s)}"
 
 # Config: brickprint/config.py reads ~/.config/brickprint/config.json on every
-# OS (no XDG lookup) unless BRICKPRINT_CONFIG points elsewhere; mirror that.
+# OS unless BRICKPRINT_CONFIG points elsewhere; mirror that.
 CONFIG_FILE="${BRICKPRINT_CONFIG:-${HOME}/.config/brickprint/config.json}"
 CONFIG_DIR="$(dirname "$CONFIG_FILE")"
 
-# Cache: same defaults as config.default_cache_dir().
+# Cache: mirrors config.default_cache_dir() (and honors XDG_CACHE_HOME on Linux).
 if [[ "$OS" == "Darwin" ]]; then
     CACHE_DIR="${HOME}/Library/Caches/brickprint"
 else
@@ -102,7 +141,7 @@ find_ldraw() {
     return 0
 }
 
-ancestor_ldview() {           # <ancestor>/tools/LDView.app, like config.py's runtime probe
+ancestor_ldview() {           # <ancestor>/tools/LDView.app, matching config.py
     local d="$HERE"
     while [[ "$d" != "/" && -n "$d" ]]; do
         d="$(dirname "$d")"
@@ -120,10 +159,11 @@ find_ldview() {
         return 0
     fi
     if [[ "$OS" == "Darwin" ]]; then
-        first_executable \
-            "/Applications/LDView.app/Contents/MacOS/LDView" \
-            "${HOME}/Applications/LDView.app/Contents/MacOS/LDView" \
-            || on_path LDView ldview || ancestor_ldview || true
+        ancestor_ldview \
+            || first_executable \
+                "/Applications/LDView.app/Contents/MacOS/LDView" \
+                "${HOME}/Applications/LDView.app/Contents/MacOS/LDView" \
+            || on_path LDView ldview || true
     else
         on_path LDView ldview \
             || first_executable /usr/bin/LDView /usr/local/bin/LDView /usr/bin/ldview \
@@ -139,7 +179,8 @@ find_bambu() {
     if [[ "$OS" == "Darwin" ]]; then
         first_executable \
             "/Applications/BambuStudio.app/Contents/MacOS/BambuStudio" \
-            "${HOME}/Applications/BambuStudio.app/Contents/MacOS/BambuStudio" || true
+            "${HOME}/Applications/BambuStudio.app/Contents/MacOS/BambuStudio" \
+            || on_path BambuStudio bambu-studio || true
     else
         on_path bambu-studio BambuStudio \
             || first_executable /usr/bin/bambu-studio /usr/local/bin/bambu-studio \
@@ -164,17 +205,35 @@ fi
 
 # --- install ---------------------------------------------------------------
 
-copy_tree() {                 # copy_tree SRC DEST  (excludes junk)
+copy_tree() {                 # copy_tree SRC DEST  (excludes dev/cache junk)
     local src="$1" dest="$2"
     if command -v rsync >/dev/null 2>&1; then
-        rsync -a --exclude '__pycache__' --exclude '.DS_Store' --exclude '.git' --exclude '.gitignore' \
-            --exclude '*.egg-info' --exclude '.pytest_cache' --exclude '.ruff_cache' --exclude '.venv' \
+        rsync -a \
+            --exclude '__pycache__' --exclude '.DS_Store' \
+            --exclude '.git' --exclude '.gitignore' --exclude '.github' \
+            --exclude 'tests' --exclude '*.egg-info' \
+            --exclude '.pytest_cache' --exclude '.ruff_cache' --exclude '.venv' \
             "$src"/ "$dest"/
     else
-        (cd "$src" && tar --exclude '__pycache__' --exclude '.DS_Store' --exclude '.git' \
-            --exclude '.gitignore' --exclude '*.egg-info' --exclude '.pytest_cache' \
-            --exclude '.ruff_cache' --exclude '.venv' -cf - .) | (cd "$dest" && tar -xf -)
+        (cd "$src" && tar \
+            --exclude '__pycache__' --exclude '.DS_Store' \
+            --exclude '.git' --exclude '.gitignore' --exclude '.github' \
+            --exclude 'tests' --exclude '*.egg-info' \
+            --exclude '.pytest_cache' --exclude '.ruff_cache' --exclude '.venv' \
+            -cf - .) | (cd "$dest" && tar -xf -)
     fi
+}
+
+sweep_backups() {             # keep newest $KEEP_BACKUPS brickprint.* dirs
+    [[ "$KEEP_BACKUPS" -gt 0 && -d "$BACKUP_ROOT" ]] || return 0
+    local idx=0 d
+    while IFS= read -r d; do
+        [[ -n "$d" && -d "$d" && ! -L "$d" ]] || continue
+        idx=$((idx + 1))
+        if [[ "$idx" -gt "$KEEP_BACKUPS" ]]; then
+            rm -rf "$d"
+        fi
+    done < <(ls -1dt "${BACKUP_ROOT}"/brickprint.* 2>/dev/null || true)
 }
 
 install_one() {
@@ -198,8 +257,10 @@ install_one() {
     chmod +x "$dest/bin/brickprint" 2>/dev/null || true
 }
 
+install_one "${HOME}/.gemini/config/skills/brickprint"
 install_one "${HOME}/.codex/skills/brickprint"
 install_one "${HOME}/.claude/skills/brickprint"
+sweep_backups
 
 mkdir -p "$CONFIG_DIR"
 if [[ ! -f "$CONFIG_FILE" ]]; then
@@ -218,6 +279,7 @@ fi
 
 echo
 echo "Installed.  Try:"
+echo "  ${HOME}/.gemini/config/skills/brickprint/bin/brickprint doctor"
+echo "  ${HOME}/.claude/skills/brickprint/bin/brickprint doctor"
 echo "  ${HOME}/.codex/skills/brickprint/bin/brickprint doctor"
-echo "  ${HOME}/.codex/skills/brickprint/bin/brickprint inventory 10337-1"
-echo "  ${HOME}/.codex/skills/brickprint/bin/brickprint build 10337-1 --bambu"
+echo "  ${HOME}/.gemini/config/skills/brickprint/bin/brickprint build 10337-1 --bambu --verify"

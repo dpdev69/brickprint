@@ -19,8 +19,17 @@ public entry point is :func:`plan`.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import math
+import os
+import re
 from collections import defaultdict
+from pathlib import Path
+
+import numpy as np
+
+CEILINGS_VERSION = 1
 
 # ---- ceiling raise (build_ceiling_v6) ----
 TARGET_CEILING = 2.2      # mm above the bed: real LEGO plate cavity depth (stud 1.7 + headroom)
@@ -125,23 +134,26 @@ def analyse(V, T, target=TARGET_CEILING):
     rel = lambda z: z - zmin  # noqa: E731
     horiz_down = defaultdict(list)    # level -> faces
     horiz_up = defaultdict(list)
+    tri_areas = [0.0] * len(T)
     for fi, t in enumerate(T):
-        zs = [V[i][2] for i in t]
+        zs = (V[t[0]][2], V[t[1]][2], V[t[2]][2])
         if max(zs) - min(zs) > ZTOL:
             continue
         n, L = tri_normal(V, t)
         if L < 1e-12:
             continue
-        lvl = round(sum(zs) / 3, 4)
+        tri_areas[fi] = L / 2.0
+        lvl = round((zs[0] + zs[1] + zs[2]) / 3.0, 4)
         (horiz_down if n[2] < 0 else horiz_up)[lvl].append(fi)
 
     def area(fs):
-        return sum(tri_normal(V, T[f])[1] / 2 for f in fs)
+        return sum(tri_areas[f] for f in fs)
 
     levels = sorted(horiz_down)
-    socket_levels = [l for l in levels if rel(l) > MIN_CEILING - ZTOL and area(horiz_down[l]) >= MIN_AREA]
+    level_areas = {l: area(horiz_down[l]) for l in levels}
+    socket_levels = [l for l in levels if rel(l) > MIN_CEILING - ZTOL and level_areas[l] >= MIN_AREA]
     out = {"zmin": zmin, "height": max(v[2] for v in V) - zmin,
-           "ceilings": [(round(rel(l), 3), round(area(horiz_down[l]), 2)) for l in levels if rel(l) > ZTOL]}
+           "ceilings": [(round(rel(l), 3), round(level_areas[l], 2)) for l in levels if rel(l) > ZTOL]}
     cand = [l for l in socket_levels if rel(l) <= STUD_REACH + ZTOL and rel(l) < target - 0.05]
     if not cand:
         deep = [round(rel(l), 3) for l in socket_levels]
@@ -156,15 +168,19 @@ def analyse(V, T, target=TARGET_CEILING):
     c = cand[0]
     d = target - rel(c)
     newz = c + d
-    out.update(level=round(rel(c), 4), d=round(d, 4), ceiling_area=round(area(horiz_down[c]), 2))
+    down_c = horiz_down[c]
+    down_c_area = level_areas[c]
+    out.update(level=round(rel(c), 4), d=round(d, 4), ceiling_area=round(down_c_area, 2))
     M = {i for i, v in enumerate(V) if abs(v[2] - c) < ZTOL}
+    # Index ceiling faces upfront so upward-face, slab-vertex, and skin checks all
+    # query O(1) cell buckets instead of scanning all of down_c.
+    dgrid = face_grid(V, T, down_c)
     # bed footprint hull
     H = hull2d([(v[0], v[1]) for v in V if abs(v[2] - zmin) < ZTOL])
     if len(H) >= 3:
         a2 = sum(H[i][0] * H[(i + 1) % len(H)][1] - H[(i + 1) % len(H)][0] * H[i][1] for i in range(len(H)))
         if a2 < 0:
             H = H[::-1]
-    down_c = horiz_down[c]
     problems = []
     edge_faces = [f for f in down_c if min(dist_inside_hull(H, V[i][:2]) for i in T[f]) < EDGE_MARGIN - 1e-6]
     edge_area = area(edge_faces)
@@ -178,20 +194,26 @@ def analyse(V, T, target=TARGET_CEILING):
     out.update(edge_area=round(edge_area, 2), notch_outline=round(notch_len, 2))
     if edge_faces and not OPEN_NOTCHES:
         problems.append(f"{len(edge_faces)} ceiling faces reach the footprint outline (open notches)")
-    elif edge_faces and edge_area > MAX_EDGE_FRACTION * area(down_c):
-        problems.append(f"{edge_area:.1f} of {area(down_c):.1f} mm2 of ceiling touches the outline")
+    elif edge_faces and edge_area > MAX_EDGE_FRACTION * down_c_area:
+        problems.append(f"{edge_area:.1f} of {down_c_area:.1f} mm2 of ceiling touches the outline")
+    above_faces = []
     for fi, t in enumerate(T):
-        k = sum(1 for i in t if i in M)
+        k = (t[0] in M) + (t[1] in M) + (t[2] in M)
         if k == 0:
+            if max(V[t[0]][2], V[t[1]][2], V[t[2]][2]) > c + ZTOL and xy_width(V, t) > VERTICAL_TOL:
+                above_faces.append(fi)
             continue
+        if k < 3 and max(V[t[0]][2], V[t[1]][2], V[t[2]][2]) > c + ZTOL and xy_width(V, t) > VERTICAL_TOL:
+            above_faces.append(fi)
         n, L = tri_normal(V, t)
         if k == 3:
             if L < 1e-12:
                 continue                      # degenerate face lying in the plane: stays in it
-            cx = sum(V[i][0] for i in t) / 3
-            cy = sum(V[i][1] for i in t) / 3
+            cx = (V[t[0]][0] + V[t[1]][0] + V[t[2]][0]) / 3.0
+            cy = (V[t[0]][1] + V[t[1]][1] + V[t[2]][1]) / 3.0
             if n[2] > 0:
-                if not any(in_tri_xy(V, T[g], cx, cy) for g in down_c):
+                cell_d = dgrid.get((int(math.floor(cx)), int(math.floor(cy))), ())
+                if not any(in_tri_xy(V, T[g], cx, cy) for g in cell_d):
                     problems.append(f"upward face {fi} at the ceiling level is not under the ceiling (exterior step)")
             continue
         if L < 1e-12:
@@ -211,56 +233,45 @@ def analyse(V, T, target=TARGET_CEILING):
     for i, v in enumerate(V):
         if i in M or not (c + ZTOL < v[2] <= newz + MIN_SKIN):
             continue
-        if any(in_tri_xy(V, T[g], v[0], v[1]) for g in down_c):
+        cell_d = dgrid.get((int(math.floor(v[0])), int(math.floor(v[1]))), ())
+        if any(in_tri_xy(V, T[g], v[0], v[1]) for g in cell_d):
             problems.append(f"vertex {i} at z={rel(v[2]):.3f} lies within {MIN_SKIN} mm above the new ceiling")
             break
     # top skin: vertical rays from the ceiling region to the next surface above
-    xs = [V[i][0] for f in down_c for i in T[f]]
-    ys = [V[i][1] for f in down_c for i in T[f]]
-    # Bounded sampling density: 0.2 mm on small parts, coarser on large
-    # plates.  A skin thinner than the step is narrower than one nozzle
-    # line, so it cannot be printed anyway.  Without this, a 6x10 plate
-    # samples ~400k points and takes minutes per part.
-    _sx, _sy = max(xs) - min(xs), max(ys) - min(ys)
+    Vnp = np.asarray(V, dtype=np.float64)
+    Tnp = np.asarray(T, dtype=np.int64)
+    Fd = Tnp[down_c]
+    xs_min, xs_max = float(Vnp[Fd, 0].min()), float(Vnp[Fd, 0].max())
+    ys_min, ys_max = float(Vnp[Fd, 1].min()), float(Vnp[Fd, 1].max())
+    # Bounded sampling density: 0.2 mm on small parts, coarser on large plates.
+    _sx, _sy = xs_max - xs_min, ys_max - ys_min
     step = max(0.2, math.sqrt(max(_sx * _sy, 1e-9) / 40000.0))
-    grid = defaultdict(list)
-    for fi, t in enumerate(T):
-        if all(i in M for i in t):
-            continue
-        if max(V[i][2] for i in t) <= c + ZTOL or xy_width(V, t) <= VERTICAL_TOL:
-            continue
-        bx0 = min(V[i][0] for i in t); bx1 = max(V[i][0] for i in t)
-        by0 = min(V[i][1] for i in t); by1 = max(V[i][1] for i in t)
-        for gx in range(int(math.floor(bx0)), int(math.floor(bx1)) + 1):
-            for gy in range(int(math.floor(by0)), int(math.floor(by1)) + 1):
-                grid[(gx, gy)].append(fi)
-    # Index the ceiling faces the same way, so each sample only tests the
-    # few triangles whose 1 mm cell contains it (a 6x10 plate has thousands
-    # of ceiling faces; testing all of them per sample is minutes of work).
-    dgrid = defaultdict(list)
-    for g in down_c:
-        t = T[g]
-        bx0 = min(V[i][0] for i in t); bx1 = max(V[i][0] for i in t)
-        by0 = min(V[i][1] for i in t); by1 = max(V[i][1] for i in t)
-        for gx in range(int(math.floor(bx0)), int(math.floor(bx1)) + 1):
-            for gy in range(int(math.floor(by0)), int(math.floor(by1)) + 1):
-                dgrid[(gx, gy)].append(g)
-    skin, nsamp = 1e9, 0
-    x = min(xs) + step / 2
-    while x < max(xs):
-        y = min(ys) + step / 2
-        while y < max(ys):
-            cell = (int(math.floor(x)), int(math.floor(y)))
-            if any(in_tri_xy(V, T[g], x, y) for g in dgrid.get(cell, ())):
-                nsamp += 1
-                best = 1e9
-                for fi in grid.get((int(math.floor(x)), int(math.floor(y))), ()):
-                    z = bary_z(V, T[fi], x, y)
-                    if z is not None and z > c + ZTOL:
-                        best = min(best, z)
-                skin = min(skin, best - newz)
-            y += step
-        x += step
+    gx = np.arange(xs_min + step / 2, xs_max, step)
+    gy = np.arange(ys_min + step / 2, ys_max, step)
+    nx_s, ny_s = len(gx), len(gy)
+    nsamp = 0
+    skin = 1e9
+    if nx_s > 0 and ny_s > 0:
+        ceil_mask = _rasterize_faces_grid(Vnp, Fd, gx, gy, step)
+        nsamp = int(ceil_mask.sum())
+        if nsamp > 0:
+            min_z = _rasterize_min_z_grid(Vnp, Tnp[above_faces], gx, gy, step, c + ZTOL) if above_faces else np.full((nx_s, ny_s), 1e9)
+            skin = float(min_z[ceil_mask].min() - newz)
+    if nsamp == 0 and down_c:
+        # Fallback for very narrow ceilings that fall between grid sample lines:
+        # probe every ceiling triangle centroid directly so skin never stays 1e9.
+        grid = face_grid(V, T, above_faces)
+        for g in down_c:
+            t = T[g]
+            cx = (V[t[0]][0] + V[t[1]][0] + V[t[2]][0]) / 3.0
+            cy = (V[t[0]][1] + V[t[1]][1] + V[t[2]][1]) / 3.0
+            nsamp += 1
+            best = 1e9
+            for fi in grid.get((int(math.floor(cx)), int(math.floor(cy))), ()):
+                z = bary_z(V, T[fi], cx, cy)
+                if z is not None and z > c + ZTOL:
+                    best = min(best, z)
+            skin = min(skin, best - newz)
     out.update(skin=round(skin, 3), skin_samples=nsamp, skin_step=round(step, 3),
                moved_vertices=len(M))
     if skin < MIN_SKIN - 1e-6:
@@ -273,6 +284,86 @@ def analyse(V, T, target=TARGET_CEILING):
                (f"; open notches on the outline ({notch_len:.1f} mm) become {d:.2f} mm taller" if notch_len > 0 else ""),
                moved={i: newz for i in M})
     return out
+
+
+def _rasterize_faces_grid(Vnp: np.ndarray, Fnp: np.ndarray, gx: np.ndarray,
+                          gy: np.ndarray, step: float) -> np.ndarray:
+    """Boolean mask (len(gx), len(gy)) of grid points inside any triangle of ``Fnp``."""
+    nx, ny = len(gx), len(gy)
+    out = np.zeros((nx, ny), dtype=bool)
+    if len(Fnp) == 0 or nx == 0 or ny == 0:
+        return out
+    x0, y0 = float(gx[0]), float(gy[0])
+    x1, y1 = Vnp[Fnp[:, 0], 0], Vnp[Fnp[:, 0], 1]
+    x2, y2 = Vnp[Fnp[:, 1], 0], Vnp[Fnp[:, 1], 1]
+    x3, y3 = Vnp[Fnp[:, 2], 0], Vnp[Fnp[:, 2], 1]
+    det = (y2 - y3) * (x1 - x3) + (x3 - x2) * (y1 - y3)
+    good = np.abs(det) >= 1e-12
+    tx_lo = np.minimum(np.minimum(x1, x2), x3)
+    tx_hi = np.maximum(np.maximum(x1, x2), x3)
+    ty_lo = np.minimum(np.minimum(y1, y2), y3)
+    ty_hi = np.maximum(np.maximum(y1, y2), y3)
+    i0 = np.maximum(0, np.floor((tx_lo - x0) / step).astype(np.int64))
+    i1 = np.minimum(nx - 1, np.ceil((tx_hi - x0) / step).astype(np.int64))
+    j0 = np.maximum(0, np.floor((ty_lo - y0) / step).astype(np.int64))
+    j1 = np.minimum(ny - 1, np.ceil((ty_hi - y0) / step).astype(np.int64))
+    invd = np.where(good, 1.0 / np.where(good, det, 1.0), 0.0)
+    for k in np.nonzero(good)[0].tolist():
+        ii0, ii1 = int(i0[k]), int(i1[k]) + 1
+        jj0, jj1 = int(j0[k]), int(j1[k]) + 1
+        if ii0 >= ii1 or jj0 >= jj1:
+            continue
+        dx = gx[ii0:ii1, None] - x3[k]
+        dy = gy[None, jj0:jj1] - y3[k]
+        iv = invd[k]
+        l1 = ((y2[k] - y3[k]) * dx + (x3[k] - x2[k]) * dy) * iv
+        l2 = ((y3[k] - y1[k]) * dx + (x1[k] - x3[k]) * dy) * iv
+        out[ii0:ii1, jj0:jj1] |= (l1 >= -1e-9) & (l2 >= -1e-9) & (1.0 - l1 - l2 >= -1e-9)
+    return out
+
+
+def _rasterize_min_z_grid(Vnp: np.ndarray, Fnp: np.ndarray, gx: np.ndarray,
+                          gy: np.ndarray, step: float, z_thresh: float) -> np.ndarray:
+    """Minimum triangle z > ``z_thresh`` over each point of grid ``(gx, gy)``."""
+    nx, ny = len(gx), len(gy)
+    min_z = np.full((nx, ny), 1e9, dtype=np.float64)
+    if len(Fnp) == 0 or nx == 0 or ny == 0:
+        return min_z
+    x0, y0 = float(gx[0]), float(gy[0])
+    x1, y1, z1 = Vnp[Fnp[:, 0], 0], Vnp[Fnp[:, 0], 1], Vnp[Fnp[:, 0], 2]
+    x2, y2, z2 = Vnp[Fnp[:, 1], 0], Vnp[Fnp[:, 1], 1], Vnp[Fnp[:, 1], 2]
+    x3, y3, z3 = Vnp[Fnp[:, 2], 0], Vnp[Fnp[:, 2], 1], Vnp[Fnp[:, 2], 2]
+    det = (y2 - y3) * (x1 - x3) + (x3 - x2) * (y1 - y3)
+    good = np.abs(det) >= 1e-12
+    tx_lo = np.minimum(np.minimum(x1, x2), x3)
+    tx_hi = np.maximum(np.maximum(x1, x2), x3)
+    ty_lo = np.minimum(np.minimum(y1, y2), y3)
+    ty_hi = np.maximum(np.maximum(y1, y2), y3)
+    i0 = np.maximum(0, np.floor((tx_lo - x0) / step).astype(np.int64))
+    i1 = np.minimum(nx - 1, np.ceil((tx_hi - x0) / step).astype(np.int64))
+    j0 = np.maximum(0, np.floor((ty_lo - y0) / step).astype(np.int64))
+    j1 = np.minimum(ny - 1, np.ceil((ty_hi - y0) / step).astype(np.int64))
+    invd = np.where(good, 1.0 / np.where(good, det, 1.0), 0.0)
+    for k in np.nonzero(good)[0].tolist():
+        ii0, ii1 = int(i0[k]), int(i1[k]) + 1
+        jj0, jj1 = int(j0[k]), int(j1[k]) + 1
+        if ii0 >= ii1 or jj0 >= jj1:
+            continue
+        dx = gx[ii0:ii1, None] - x3[k]
+        dy = gy[None, jj0:jj1] - y3[k]
+        iv = invd[k]
+        l1 = ((y2[k] - y3[k]) * dx + (x3[k] - x2[k]) * dy) * iv
+        l2 = ((y3[k] - y1[k]) * dx + (x1[k] - x3[k]) * dy) * iv
+        l3 = 1.0 - l1 - l2
+        inside = (l1 >= -1e-9) & (l2 >= -1e-9) & (l3 >= -1e-9)
+        if not inside.any():
+            continue
+        z = l1 * z1[k] + l2 * z2[k] + l3 * z3[k]
+        valid = inside & (z > z_thresh)
+        if valid.any():
+            sub = min_z[ii0:ii1, jj0:jj1]
+            min_z[ii0:ii1, jj0:jj1] = np.where(valid & (z < sub), z, sub)
+    return min_z
 
 
 # --------------------------------------------------------------------------
@@ -296,9 +387,6 @@ SOCKET_CLUTCH_TOP = 1.8    # mm, socket walls that grip a stud
 STUD_TOP_H = 1.6           # mm, top stud height in the LDraw meshes
 BAND_ZONE_TOL = 0.04       # mm a band layer may overlap a fit-surface zone (half a 0.08 layer)
 BRIDGE_MIN_R = 1.0         # mm, inscribed radius for a ceiling to be bridged (else overhang walls)
-MIN_AREA = 2.0
-MIN_CEILING = 0.8
-ZTOL = 1e-4
 PROBE_DZ = 0.05            # mm below the ceiling where the cavity is sampled
 STRAND_PITCH = 0.45        # mm, sampling pitch of the span estimate (v6 G-code pitch 0.455)
 
@@ -312,21 +400,31 @@ def box(x0, x1, y0, y1, z0, z1):
 
 def slice_segments(V, T, z):
     """segments of the mesh cross-section at plane z: [(x1, y1, x2, y2)]"""
-    out = []
-    for t in T:
-        P = [V[i] for i in t]
-        above = [p for p in P if p[2] > z]
-        below = [p for p in P if p[2] <= z]
-        if not above or not below:
-            continue
-        pts = []
-        for a in above:
-            for b in below:
-                s = (z - b[2]) / (a[2] - b[2])
-                pts.append((b[0] + s * (a[0] - b[0]), b[1] + s * (a[1] - b[1])))
-        if len(pts) >= 2:
-            out.append((pts[0][0], pts[0][1], pts[1][0], pts[1][1]))
-    return out
+    if not len(T):
+        return []
+    Vnp = np.asarray(V, dtype=np.float64)
+    Tnp = np.asarray(T, dtype=np.int64)
+    Vz = Vnp[:, 2]
+    S = Vz[Tnp] > z
+    cnt = S.sum(axis=1)
+    m = (cnt == 1) | (cnt == 2)
+    if not m.any():
+        return []
+    F = Tnp[m]
+    Sm = S[m]
+    cm = cnt[m]
+    lone = np.where(cm == 1, np.argmax(Sm, axis=1), np.argmin(Sm, axis=1))
+    rows = np.arange(len(F))
+    u = F[rows, lone]
+    v1 = F[rows, (lone + 1) % 3]
+    v2 = F[rows, (lone + 2) % 3]
+    s1 = (z - Vz[u]) / (Vz[v1] - Vz[u])
+    s2 = (z - Vz[u]) / (Vz[v2] - Vz[u])
+    x1 = Vnp[u, 0] + s1 * (Vnp[v1, 0] - Vnp[u, 0])
+    y1 = Vnp[u, 1] + s1 * (Vnp[v1, 1] - Vnp[u, 1])
+    x2 = Vnp[u, 0] + s2 * (Vnp[v2, 0] - Vnp[u, 0])
+    y2 = Vnp[u, 1] + s2 * (Vnp[v2, 1] - Vnp[u, 1])
+    return list(zip(x1.tolist(), y1.tolist(), x2.tolist(), y2.tolist()))
 
 
 def line_intervals(segs, axis, coord):
@@ -403,59 +501,49 @@ def inscribed_radius(V, T, faces, step=0.2):
     """Approximate radius of the largest disc inside the union of `faces`.
 
     Rasterise at ``step`` (0.2 mm keeps the 1.0 mm bridge decision stable)
-    and take an 8-neighbour BFS distance from the boundary.  The previous
-    exact min-over-all-border-pairs loop was O(inside x border): a 6x10
-    plate has ~60 socket cavities and took minutes per part.
+    and compute the exact 8-neighbour Chebyshev distance from the 4-neighbour
+    boundary via iterative 3x3 NumPy boolean erosion.
     """
-    xs = [V[i][0] for f in faces for i in T[f]]
-    ys = [V[i][1] for f in faces for i in T[f]]
-    g = face_grid(V, T, faces)
-    x0, y0 = min(xs) - step, min(ys) - step
-    nx, ny = int((max(xs) - x0) / step) + 2, int((max(ys) - y0) / step) + 2
-    inside = {(i, j) for i in range(nx) for j in range(ny)
-              if in_faces(V, T, faces, x0 + (i + 0.5) * step, y0 + (j + 0.5) * step, g)}
-    if not inside:
+    if not faces:
         return 0.0, 0.0
-    border = [(i, j) for (i, j) in inside if any((i + a, j + b) not in inside
-                                                for a, b in ((1, 0), (-1, 0), (0, 1), (0, -1)))]
-    # multi-source BFS (8-neighbour) from the boundary cells
-    from collections import deque
-    dist = {p: 0 for p in border}
-    q = deque(border)
+    Vnp = np.asarray(V, dtype=np.float64)
+    Tnp = np.asarray(T, dtype=np.int64)
+    Fnp = Tnp[faces]
+    xs = Vnp[Fnp, 0]
+    ys = Vnp[Fnp, 1]
+    x0 = float(xs.min()) - step
+    y0 = float(ys.min()) - step
+    nx = int((float(xs.max()) - x0) / step) + 2
+    ny = int((float(ys.max()) - y0) / step) + 2
+    gx = x0 + (np.arange(nx) + 0.5) * step
+    gy = y0 + (np.arange(ny) + 0.5) * step
+    inside = _rasterize_faces_grid(Vnp, Fnp, gx, gy, step)
+    area_px = int(inside.sum())
+    if area_px == 0:
+        return 0.0, 0.0
+    # 4-neighbour erosion removes the dist=0 border cells; subsequent 3x3
+    # 8-neighbour erosions peel dist=1, 2, ... layers identically to BFS.
+    pad = np.pad(inside, 1, constant_values=False)
+    cur = pad[1:-1, 1:-1] & pad[:-2, 1:-1] & pad[2:, 1:-1] & pad[1:-1, :-2] & pad[1:-1, 2:]
     best_cells = 0
-    while q:
-        i, j = q.popleft()
-        d = dist[(i, j)] + 1
-        for a, b in ((1, 0), (-1, 0), (0, 1), (0, -1),
-                     (1, 1), (1, -1), (-1, 1), (-1, -1)):
-            n = (i + a, j + b)
-            if n in inside and n not in dist:
-                dist[n] = d
-                if d > best_cells:
-                    best_cells = d
-                q.append(n)
-    return (best_cells + 0.5) * step, len(inside) * step * step
+    while cur.any():
+        best_cells += 1
+        p = np.pad(cur, 1, constant_values=False)
+        h = p[:, :-2] & p[:, 1:-1] & p[:, 2:]
+        cur = h[:-2, :] & h[1:-1, :] & h[2:, :]
+    return (best_cells + 0.5) * step, area_px * step * step
 
 
-
-def spans(V, T, faces, zc, zmin, strand_axis, ribs=()):
-    """free strand spans under the ceiling at local z zc: strands along strand_axis ('x' or 'y'),
-    sampled every STRAND_PITCH.  Returns [(line coord, [free span lengths])]."""
-    segs = slice_segments(V, T, zc - PROBE_DZ)
-    g = face_grid(V, T, faces)
+def _base_free_spans(V, T, faces, segs, g, strand_axis):
+    """Compute base free intervals [(line_coord, [(a1, b0), ...])] with no ribs."""
     pts = [V[i] for f in faces for i in T[f]]
-    # lines perpendicular to the sampling direction: strand along x -> lines y = const
     across = "y" if strand_axis == "x" else "x"
     lo = min(p[1] if across == "y" else p[0] for p in pts)
     hi = max(p[1] if across == "y" else p[0] for p in pts)
     out = []
     c = lo + STRAND_PITCH / 2
     while c < hi:
-        M = line_intervals(segs, "y" if strand_axis == "x" else "x", c)   # material along the strand
-        # add ribs as material
-        for r in ribs:
-            if r["axis"] == strand_axis and r["lo"] - 1e-9 <= c <= r["hi"] + 1e-9:
-                M.append((r["c"] - RIB_W / 2, r["c"] + RIB_W / 2))
+        M = line_intervals(segs, across, c)
         M.sort()
         mm = []
         for a, b in M:
@@ -468,18 +556,60 @@ def spans(V, T, faces, zc, zmin, strand_axis, ribs=()):
             mid = (a1 + b0) / 2
             px, py = (mid, c) if strand_axis == "x" else (c, mid)
             if in_faces(V, T, faces, px, py, g):
-                free.append(b0 - a1)
+                free.append((a1, b0))
         if free:
             out.append((c, free))
         c += STRAND_PITCH
     return out
 
 
-def rib_extent(V, T, faces, zc, axis, c):
+def _spans_with_ribs(base_lines, strand_axis, ribs=()):
+    """Split cached base free intervals by ``ribs`` -> [(line_coord, [span_lengths])]."""
+    if not ribs:
+        return [(lc, [b - a for a, b in ivs]) for lc, ivs in base_lines]
+    axis_ribs = [(r["lo"] - 1e-9, r["hi"] + 1e-9, r["c"] - RIB_W / 2, r["c"] + RIB_W / 2)
+                 for r in ribs if r["axis"] == strand_axis]
+    if not axis_ribs:
+        return [(lc, [b - a for a, b in ivs]) for lc, ivs in base_lines]
+    out = []
+    for lc, free_iv in base_lines:
+        active = [(ra, rb) for rlo, rhi, ra, rb in axis_ribs if rlo <= lc <= rhi]
+        if not active:
+            out.append((lc, [b - a for a, b in free_iv]))
+            continue
+        cur = free_iv
+        for ra, rb in active:
+            nxt = []
+            for a, b in cur:
+                if rb <= a + 1e-9 or ra >= b - 1e-9:
+                    nxt.append((a, b))
+                else:
+                    if ra > a + 1e-9:
+                        nxt.append((a, ra))
+                    if rb < b - 1e-9:
+                        nxt.append((rb, b))
+            cur = nxt
+            if not cur:
+                break
+        if cur:
+            out.append((lc, [b - a for a, b in cur]))
+    return out
+
+
+def spans(V, T, faces, zc, zmin, strand_axis, ribs=(), *, _segs=None, _grid=None):
+    """free strand spans under the ceiling at local z zc: strands along strand_axis ('x' or 'y'),
+    sampled every STRAND_PITCH.  Returns [(line coord, [free span lengths])]."""
+    segs = slice_segments(V, T, zc - PROBE_DZ) if _segs is None else _segs
+    g = face_grid(V, T, faces) if _grid is None else _grid
+    base = _base_free_spans(V, T, faces, segs, g, strand_axis)
+    return _spans_with_ribs(base, strand_axis, ribs)
+
+
+def rib_extent(V, T, faces, zc, axis, c, *, _segs=None, _grid=None):
     """rib along the line {axis = c} (axis 'x': rib runs in y at x = c).  Returns (lo, hi, notes) in
     the running coordinate, or (None, None, reason)."""
-    segs = slice_segments(V, T, zc - PROBE_DZ)
-    g = face_grid(V, T, faces)
+    segs = slice_segments(V, T, zc - PROBE_DZ) if _segs is None else _segs
+    g = face_grid(V, T, faces) if _grid is None else _grid
     lines = [c - RIB_W / 2 + 1e-3, c, c + RIB_W / 2 - 1e-3]
     los, his, outer_lo, outer_hi = [], [], [], []
     for lc in lines:
@@ -590,7 +720,10 @@ def analyse_part(V, T, bridge_angle, want_ribs=True, want_bands=True):
         if r < BRIDGE_MIN_R:
             cz["decision"] = f"not bridged: inscribed radius {r:.2f} < {BRIDGE_MIN_R} (overhang walls close it)"
             continue
-        sp = spans(V, T, faces, zc + zmin, zmin, strand_axis)
+        segs = slice_segments(V, T, zc + zmin - PROBE_DZ)
+        g = face_grid(V, T, faces)
+        base_lines = _base_free_spans(V, T, faces, segs, g, strand_axis)
+        sp = _spans_with_ribs(base_lines, strand_axis)
         allf = sorted(x for _, f in sp for x in f)
         cz["spans_before"] = dict(n=len(sp), max=round(max(allf), 2) if allf else 0,
                                   median=round(allf[len(allf) // 2], 2) if allf else 0,
@@ -604,8 +737,8 @@ def analyse_part(V, T, bridge_angle, want_ribs=True, want_bands=True):
         if vis_slope and band[0][0] < vis_slope[1] and band[-1][1] > vis_slope[0]:
             # 0.24 mm layers would show as coarse steps on the slope face: anchored ends only, on the
             # native 0.08 mm bridge layer (the first layer whose slice plane is above the ceiling)
-            g = z0 if z0 + 0.04 > zc + 1e-3 else round(z0 + 0.08, 4)
-            band = [(g, round(g + 0.08, 4), {"wall_loops": BAND_ANCHOR_WALLS, "layer_height": "0.08"})]
+            g_z = z0 if z0 + 0.04 > zc + 1e-3 else round(z0 + 0.08, 4)
+            band = [(g_z, round(g_z + 0.08, 4), {"wall_loops": BAND_ANCHOR_WALLS, "layer_height": "0.08"})]
             why.append(f"slope face {vis_slope[0]:.2f}..{vis_slope[1]:.2f} in the band: anchor only at 0.08")
         for b0, b1, opts in band:
             # a band layer may not reach into a fit-surface zone by more than half a 0.08 layer
@@ -641,34 +774,45 @@ def analyse_part(V, T, bridge_angle, want_ribs=True, want_bands=True):
             cands = [bx0 + 8 * k for k in range(1, round((bx1 - bx0) / 8))]
         else:
             cands = [by0 + 8 * k for k in range(1, round((by1 - by0) / 8))]
-        ribs, notes = [], []
-        worst = cz["spans_before"]["max"]
-        while worst > RIB_SPAN_MAX and cands:
-            best = None
-            for c in cands:
-                # stud-axis clearance
+        # Precompute rib_extent once per candidate (geometry does not change across rounds)
+        cand_ribs = {}
+        notes = []
+        for c in cands:
+            if studs:
                 dmin = min(abs(c - (sx if rib_axis == "x" else sy)) for sx, sy in studs) - RIB_W / 2
-                if dmin < STUD_R + RIB_STUD_MARGIN:
-                    notes.append(f"line {c}: {dmin:.2f} mm from a stud axis")
-                    continue
-                lo, hi, why = rib_extent(V, T, faces, zc + zmin, rib_axis, c)
-                if lo is None:
-                    notes.append(f"line {c}: {why}")
-                    continue
-                rib = dict(axis=rib_axis, c=c, lo=lo, hi=hi, why=why, stud_dist=round(dmin, 2))
-                sp2 = spans(V, T, faces, zc + zmin, zmin, strand_axis, ribs + [rib])
-                w2 = max(x for _, f in sp2 for x in f)
+            else:
+                dmin = math.inf
+            if dmin < STUD_R + RIB_STUD_MARGIN:
+                notes.append(f"line {c}: {dmin:.2f} mm from a stud axis")
+                continue
+            lo, hi, why = rib_extent(V, T, faces, zc + zmin, rib_axis, c, _segs=segs, _grid=g)
+            if lo is None:
+                notes.append(f"line {c}: {why}")
+                continue
+            cand_ribs[c] = dict(axis=rib_axis, c=c, lo=lo, hi=hi, why=why,
+                                stud_dist=round(dmin, 2) if math.isfinite(dmin) else None)
+        ribs = []
+        rem = list(cand_ribs)
+        worst = cz["spans_before"]["max"]
+        sp_after = sp
+        while worst > RIB_SPAN_MAX and rem:
+            best = None
+            for c in rem:
+                rib = cand_ribs[c]
+                sp2 = _spans_with_ribs(base_lines, strand_axis, ribs + [rib])
+                w2 = max((x for _, f in sp2 for x in f), default=0.0)
                 if best is None or w2 < best[0]:
                     best = (w2, rib, sp2)
             if best is None or best[0] >= worst - 1e-6:
                 break
             worst = best[0]
             ribs.append(best[1])
-            cands.remove(best[1]["c"])
+            rem.remove(best[1]["c"])
             sp_after = best[2]
         if ribs:
             allf = sorted(x for _, f in sp_after for x in f)
-            cz["spans_after"] = dict(n=len(sp_after), max=round(max(allf), 2), median=round(allf[len(allf) // 2], 2),
+            cz["spans_after"] = dict(n=len(sp_after), max=round(max(allf), 2) if allf else 0,
+                                     median=round(allf[len(allf) // 2], 2) if allf else 0,
                                      over7=sum(1 for _, f in sp_after if max(f) > RIB_SPAN_MAX),
                                      over8=sum(1 for _, f in sp_after if max(f) > 8.0))
             for rb in ribs:
@@ -690,30 +834,100 @@ def rib_mesh_local(rb, zmin):
 
 
 # --------------------------------------------------------------------------
-# public entry point
+# public entry point & disk cache
 # --------------------------------------------------------------------------
+def _plan_cache_path(V_arr: np.ndarray, T_arr: np.ndarray, bridge_angle: float,
+                     raise_ceiling: bool, want_bands: bool, want_ribs: bool,
+                     cache_dir, part_file: str | None) -> tuple[Path | None, str]:
+    h = hashlib.sha1(np.ascontiguousarray(V_arr, dtype=np.float32).tobytes())
+    h.update(np.ascontiguousarray(T_arr, dtype=np.int32).tobytes())
+    h.update(f":v{CEILINGS_VERSION}:{float(bridge_angle):g}:{int(raise_ceiling)}:{int(want_bands)}:{int(want_ribs)}".encode())
+    tag = h.hexdigest()[:16]
+    if cache_dir is False or cache_dir == "":
+        return None, tag
+    if cache_dir is not None:
+        croot = Path(cache_dir)
+    else:
+        if os.environ.get("BRICKPRINT_NO_CEILINGS_CACHE", "").strip() not in ("", "0"):
+            return None, tag
+        from . import ldraw
+        croot = ldraw._ACTIVE_CACHE_ROOT
+        if croot is None or not croot.is_dir():
+            return None, tag
+    if part_file:
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", part_file)
+        return croot / f"{safe}.ceil{CEILINGS_VERSION}.json", tag
+    return croot / f"ceil{CEILINGS_VERSION}_{tag}.json", tag
+
+
+def _restore_cached_plan(hit: dict, V_arr: np.ndarray) -> dict:
+    moved_z = hit.get("moved_z")
+    moved_idx = hit.get("moved_idx")
+    if moved_z is not None and moved_idx:
+        out_v = V_arr.copy()
+        out_v[moved_idx, 2] = float(moved_z)
+        Vl = [tuple(row) for row in out_v.tolist()]
+    else:
+        Vl = [tuple(row) for row in V_arr.tolist()]
+    raise_rep = dict(hit["raise"])
+    if "ceilings" in raise_rep:
+        raise_rep["ceilings"] = [tuple(c) for c in raise_rep["ceilings"]]
+    bands = [(float(z0), float(z1), dict(o)) for z0, z1, o in hit["bands"]]
+    rib_raw = hit["ribs"]
+    rib = None if rib_raw is None else ([tuple(v) for v in rib_raw[0]], [tuple(t) for t in rib_raw[1]])
+    res = dict(hit["report"])
+    if "zones" in res:
+        res["zones"] = [tuple(z) for z in res["zones"]]
+    return {"V": Vl, "raise": raise_rep, "bands": bands, "ribs": rib, "report": res}
+
+
 def plan(V, T, bridge_angle: float = 180.0, raise_ceiling: bool = True,
-         want_bands: bool = True, want_ribs: bool = True) -> dict:
+         want_bands: bool = True, want_ribs: bool = True, *,
+         cache_dir: Path | str | bool | None = None,
+         part_file: str | None = None) -> dict:
     """Plan the recipe for one oriented part mesh (bed frame, any z origin).
 
     Returns ``{"V": vertex list (ceiling raised, or unchanged), "raise": the
     raise report, "bands": [(z0, z1, {option: value})] relative to the part's
     bottom, "ribs": (V, T) merged rib mesh in the part frame or None,
     "report": the band/rib analysis}``.  ``layer_height`` defaults to 0.24 in
-    a band unless the band sets it."""
+    a band unless the band sets it.
+
+    Results are cached atomically next to ``.c2.json`` in the active
+    ``MeshCache`` root (or ``cache_dir``) keyed on the posed mesh, flags and
+    ``CEILINGS_VERSION``.  Pass ``cache_dir=False`` to bypass disk caching."""
+    V_arr = np.asarray(V, dtype=np.float64)
+    T_arr = np.asarray(T, dtype=np.int64)
+    cpath, tag = _plan_cache_path(V_arr, T_arr, bridge_angle, raise_ceiling,
+                                  want_bands, want_ribs, cache_dir, part_file)
+    if cpath is not None and cpath.is_file():
+        try:
+            hit = json.loads(cpath.read_text())
+            if hit.get("tag") == tag:
+                return _restore_cached_plan(hit, V_arr)
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+
     # The analysis assumes the part is centred on the origin in X-Y (the LDraw
     # frame of the Seagull meshes); brickprint meshes start at a corner.  Parts
     # whose body is not centred in their bounding box (one-sided side studs)
     # are judged conservatively: their bands are refused.
-    cx = (min(float(v[0]) for v in V) + max(float(v[0]) for v in V)) / 2
-    cy = (min(float(v[1]) for v in V) + max(float(v[1]) for v in V)) / 2
-    Vl = [(float(v[0]) - cx, float(v[1]) - cy, float(v[2])) for v in V]
-    Tl = [tuple(int(i) for i in t) for t in T]
+    cx = float((V_arr[:, 0].min() + V_arr[:, 0].max()) / 2.0)
+    cy = float((V_arr[:, 1].min() + V_arr[:, 1].max()) / 2.0)
+    V_centered = V_arr.copy()
+    V_centered[:, 0] -= cx
+    V_centered[:, 1] -= cy
+    Vl = [tuple(row) for row in V_centered.tolist()]
+    Tl = [tuple(row) for row in T_arr.tolist()]
     rep = {"status": "off"}
+    moved_z = None
+    moved_idx: list[int] = []
     if raise_ceiling:
         rep = analyse(Vl, Tl)
         if rep.get("status") == "raise":
             moved = rep["moved"]
+            moved_idx = sorted(moved)
+            moved_z = next(iter(moved.values())) if moved else None
             Vl = [(v[0], v[1], moved[i]) if i in moved else v for i, v in enumerate(Vl)]
     res = analyse_part(Vl, Tl, float(bridge_angle), want_ribs=want_ribs, want_bands=want_bands)
     zmin = min(v[2] for v in Vl)
@@ -732,5 +946,22 @@ def plan(V, T, bridge_angle: float = 180.0, raise_ceiling: bool = True,
             RT += [(a + n, b + n, c + n) for a, b, c in bt]
         rib = ([(x + cx, y + cy, z) for x, y, z in RV], RT)
     Vl = [(x + cx, y + cy, z) for x, y, z in Vl]
-    return {"V": Vl, "raise": {k: v for k, v in rep.items() if k != "moved"},
+    raise_clean = {k: v for k, v in rep.items() if k != "moved"}
+    if cpath is not None:
+        try:
+            from . import ldraw
+            cpath.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "tag": tag,
+                "raise": raise_clean,
+                "moved_z": moved_z,
+                "moved_idx": moved_idx,
+                "bands": [[z0, z1, o] for z0, z1, o in bands],
+                "ribs": None if rib is None else [[list(v) for v in rib[0]], [list(t) for t in rib[1]]],
+                "report": res,
+            }
+            ldraw._atomic_write_text(cpath, json.dumps(payload))
+        except OSError:
+            pass
+    return {"V": Vl, "raise": raise_clean,
             "bands": bands, "ribs": rib, "report": res}

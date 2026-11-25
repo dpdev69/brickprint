@@ -12,14 +12,31 @@ export BRICKPRINT_LDRAW=/path/to/ldraw
 
 The directory must contain `LDConfig.ldr`, `parts/`, and `p/`.
 
+## `command not found: brickprint`
+
+`install.sh` does not add `brickprint` to `PATH`. Call the launcher next to the
+installed skill (or `./bin/brickprint` from a repo checkout):
+
+```bash
+~/.gemini/config/skills/brickprint/bin/brickprint doctor   # Antigravity
+~/.claude/skills/brickprint/bin/brickprint doctor          # Claude Code
+~/.codex/skills/brickprint/bin/brickprint doctor           # Codex
+```
+
+Symlinking `bin/brickprint` into a `PATH` directory (such as
+`~/.local/bin/brickprint`) is supported.
+
 ## `ERROR: numpy is not importable by this Python`
 
-brickprint needs numpy. `bin/brickprint` uses `$BRICKPRINT_PYTHON` if set,
-else Blender 5.2's bundled `python3.13`, else Blender 5.1's `python3.11`, else
-plain `python3` — and a system/Homebrew `python3` usually has no numpy. This
-error (also printed by `doctor`, with `python bin` naming the interpreter and
-`numpy (missing)`) means the launcher fell back to such a `python3`, typically
-because Blender moved or changed version. Point it at a Python with numpy:
+brickprint needs Python 3.9+ with numpy. `bin/brickprint` checks, in order:
+`$BRICKPRINT_PYTHON`, a local `.venv/bin/python` inside the skill directory,
+the newest Blender bundled Python under
+`/Applications/Blender.app/Contents/Resources/*/python/bin/python3*`, and
+finally plain `python3` — and a system/Homebrew `python3` usually has no numpy.
+This error (also printed by `doctor`, with `python bin` naming the interpreter
+and `numpy (missing)`) means the launcher fell back to such a `python3`,
+typically because Blender is absent or no venv exists. Point it at a Python
+with numpy:
 
 ```bash
 export BRICKPRINT_PYTHON=/Applications/Blender.app/Contents/Resources/5.2/python/bin/python3.13

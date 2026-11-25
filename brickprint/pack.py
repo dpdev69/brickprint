@@ -34,26 +34,68 @@ class Bin:
         self._split((x, y, w, h))
 
     def _split(self, placed) -> None:
-        new_free = []
+        kept = []
+        created = []
+        px0, py0, pw, ph = placed
+        px1, py1 = px0 + pw, py0 + ph
         for r in self.free:
-            if not _intersects(r, placed):
-                new_free.append(r)
+            rx0, ry0, rw, rh = r
+            rx1, ry1 = rx0 + rw, ry0 + rh
+            if rx1 <= px0 or px1 <= rx0 or ry1 <= py0 or py1 <= ry0:
+                kept.append(r)
                 continue
-            if placed[0] > r[0] + 1e-9:
-                new_free.append((r[0], r[1], placed[0] - r[0], r[3]))
-            if placed[0] + placed[2] < r[0] + r[2] - 1e-9:
-                new_free.append((placed[0] + placed[2], r[1],
-                                 r[0] + r[2] - placed[0] - placed[2], r[3]))
-            if placed[1] > r[1] + 1e-9:
-                new_free.append((r[0], r[1], r[2], placed[1] - r[1]))
-            if placed[1] + placed[3] < r[1] + r[3] - 1e-9:
-                new_free.append((r[0], placed[1] + placed[3],
-                                 r[2], r[1] + r[3] - placed[1] - placed[3]))
-        self.free = [
-            a for a in new_free
-            if a[2] > 1e-6 and a[3] > 1e-6
-            and not any(_contains(b, a) for b in new_free if b is not a)
-        ]
+            if px0 > rx0 + 1e-9:
+                w = px0 - rx0
+                if w > 1e-6 and rh > 1e-6:
+                    created.append((rx0, ry0, w, rh))
+            if px1 < rx1 - 1e-9:
+                w = rx1 - px1
+                if w > 1e-6 and rh > 1e-6:
+                    created.append((px1, ry0, w, rh))
+            if py0 > ry0 + 1e-9:
+                h = py0 - ry0
+                if rw > 1e-6 and h > 1e-6:
+                    created.append((rx0, ry0, rw, h))
+            if py1 < ry1 - 1e-9:
+                h = ry1 - py1
+                if rw > 1e-6 and h > 1e-6:
+                    created.append((rx0, py1, rw, h))
+        if not created:
+            self.free = kept
+            return
+        # Unsplit (kept) rects are already maximal and cannot be contained by
+        # newly split (created) rects, so only prune created against kept and
+        # created against created (using index order to break exact ties).
+        surviving = []
+        for a in created:
+            ax0, ay0, aw, ah = a
+            ax1, ay1 = ax0 + aw, ay0 + ah
+            contained = False
+            for bx0, by0, bw, bh in kept:
+                if bw >= aw and bh >= ah and bx0 <= ax0 and by0 <= ay0 and bx0 + bw >= ax1 and by0 + bh >= ay1:
+                    contained = True
+                    break
+            if not contained:
+                surviving.append(a)
+        pruned = []
+        n = len(surviving)
+        for i, a in enumerate(surviving):
+            ax0, ay0, aw, ah = a
+            ax1, ay1 = ax0 + aw, ay0 + ah
+            contained = False
+            for j in range(n):
+                if j == i:
+                    continue
+                b = surviving[j]
+                bx0, by0, bw, bh = b
+                if bw >= aw and bh >= ah and bx0 <= ax0 and by0 <= ay0 and bx0 + bw >= ax1 and by0 + bh >= ay1:
+                    if b != a or j < i:
+                        contained = True
+                        break
+            if not contained:
+                pruned.append(a)
+        kept.extend(pruned)
+        self.free = kept
 
 
 def _intersects(a, b) -> bool:
@@ -188,7 +230,7 @@ def pack(
             b.insts.append(inst)
         return [b for b in bins if b.items]
 
-    groups = []  # [color_id, normal_bins, support_bins, support_insts]
+    groups = []  # [color_id, normal_bins, support_bins]
     for color_id in color_order:
         normal = [i for i in by_color[color_id] if not i.get("needs_support")]
         sup = [i for i in by_color[color_id] if i.get("needs_support")]
@@ -198,7 +240,7 @@ def pack(
             b.support = ""
         for b in sb:
             b.support = "plate"
-        groups.append([color_id, nb, sb, sup])
+        groups.append([color_id, nb, sb])
 
     mixed = {"": [], "plate": []}  # support kind -> [[(color_id, [(inst, x, y)]), ...], ...]
 
@@ -213,21 +255,31 @@ def pack(
         """Compact layouts of one colour group as (bw, bh, [(inst, x, y)]),
         smallest bounding box first.  Positions are of the inflated rects."""
         order = sorted(insts, key=size_key, reverse=True)
-        min_w = max(inflated(i)[0] for i in order)
-        widths = sorted({min(usable_w, max(min_w, usable_w * k / 12)) for k in range(1, 13)})
+        infl = [(inst, *inflated(inst)) for inst in order]
+        if len(infl) == 1:
+            inst, iw, ih = infl[0]
+            if iw <= usable_w + 1e-9 and ih <= usable_h + 1e-9:
+                return [(iw, ih, [(inst, 0.0, 0.0)])]
+            return []
+        min_w = max(iw for _, iw, _ in infl)
+        max_w = min(usable_w, sum(iw for _, iw, _ in infl))
+        widths = sorted({min(max_w, max(min_w, usable_w * k / 12)) for k in range(1, 13)})
         shapes = []
         for width in widths:
             b = Bin(width, usable_h)
             layout = []
-            for inst in order:
-                iw, ih = inflated(inst)
+            bw = 0.0
+            bh = 0.0
+            for inst, iw, ih in infl:
                 pos = b.insert(iw, ih, inst["part_file"])
                 if pos is None:
                     break
                 layout.append((inst, pos[0], pos[1]))
+                if pos[0] + iw > bw:
+                    bw = pos[0] + iw
+                if pos[1] + ih > bh:
+                    bh = pos[1] + ih
             else:
-                bw = max(x + inflated(i)[0] for i, x, _ in layout)
-                bh = max(y + inflated(i)[1] for i, _, y in layout)
                 shapes.append((bw, bh, layout))
         shapes = [s for s in shapes
                   if not any(o is not s and o[0] <= s[0] + 1e-9 and o[1] <= s[1] + 1e-9
@@ -302,32 +354,36 @@ def pack(
         if not cands:
             break
         g = min(cands, key=lambda g: (sum(len(b.items) for b in g[2]), len(g[2])))
-        color_id, nb, sb, sup = g
+        color_id, nb, sb = g
+        # Only fold support instances still on this colour's unmixed support bins
+        rem_sup = [inst for b in sb for inst in b.insts]
         target = nb[-1]
-        free, items = list(target.free), list(target.items)
+        free, items, b_insts = list(target.free), list(target.items), list(target.insts)
         ok = True
-        for inst in sorted(sup, key=lambda i: (i["size"][0] * i["size"][1]), reverse=True):
+        for inst in sorted(rem_sup, key=size_key, reverse=True):
             w, d, _ = inst["size"]
-            pos = target.insert(w + gap, d + gap, inst["part_file"])
+            pad = float(inst.get("pad") or 0.0)
+            pos = target.insert(w + 2 * pad + gap, d + 2 * pad + gap, inst["part_file"])
             if pos is None:
                 ok = False
                 break
-            target.items[-1] = (inst["part_file"], pos[0], pos[1], w, d)
+            target.items[-1] = (inst["part_file"], pos[0] + pad, pos[1] + pad, w, d)
+            target.insts.append(inst)
         if not ok:
-            target.free, target.items = free, items
+            target.free, target.items, target.insts = free, items, b_insts
             print(f"WARNING: support parts of colour {color_id} do not fit on its last plate; "
                   "kept on their own plate(s)")
             g[1], g[2] = nb + sb, []
             continue
         target.support = "folded"
-        print(f"folded {len(sup)} support part(s) of colour {color_id} into its last normal "
+        print(f"folded {len(rem_sup)} support part(s) of colour {color_id} into its last normal "
               f"plate (plate limit {max_plates}); supports enabled on that plate")
         g[2] = []
 
     def info_of(color_id):
         return colors.get(color_id, {"name": f"Color {color_id}", "rgb": "CCCCCC", "is_trans": False})
 
-    for color_id, nb, sb, _ in groups:
+    for color_id, nb, sb in groups:
         info = info_of(color_id)
         normal = [b for b in nb if b.support != "plate"]
         supp = [b for b in nb if b.support == "plate"] + sb

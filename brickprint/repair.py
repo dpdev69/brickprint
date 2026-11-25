@@ -90,39 +90,59 @@ def mesh_metrics(V: np.ndarray, T: np.ndarray) -> dict:
 # --------------------------------------------------------------------------
 
 def _merge_vertices(V: np.ndarray, T: np.ndarray, tol: float):
-    """Union vertices within ``tol`` (checks the 27 neighbouring grid cells)."""
+    """Union vertices within ``tol`` (checks the 14 forward half-neighbourhood cells)."""
     n = len(V)
+    if n == 0:
+        return V, T, 0
     q = np.floor(V / tol).astype(np.int64)
-    parent = np.arange(n)
+    parent = list(range(n))
 
-    def find(x):
+    def find(x: int) -> int:
         while parent[x] != x:
             parent[x] = parent[parent[x]]
             x = parent[x]
         return x
 
-    cells: dict[tuple, list[int]] = {}
-    for i, key in enumerate(map(tuple, q)):
-        cells.setdefault(key, []).append(i)
-    offs = [(dx, dy, dz) for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1)]
+    cells: dict[tuple[int, int, int], list[int]] = {}
+    for i, (qx, qy, qz) in enumerate(q.tolist()):
+        cells.setdefault((qx, qy, qz), []).append(i)
+    fwd_offs = [(dx, dy, dz)
+                for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1)
+                if (dx, dy, dz) > (0, 0, 0)]
     tol2 = tol * tol
     for key, members in cells.items():
+        kx, ky, kz = key
+        # Same-cell pairs (upper triangle)
+        if len(members) >= 2:
+            m_arr = np.asarray(members, dtype=np.int64)
+            Pm = V[m_arr]
+            for idx_a in range(len(members) - 1):
+                i = members[idx_a]
+                d2 = ((Pm[idx_a + 1:] - Pm[idx_a]) ** 2).sum(axis=1)
+                for off in np.nonzero(d2 <= tol2)[0].tolist():
+                    ri, rj = find(i), find(members[idx_a + 1 + off])
+                    if ri != rj:
+                        if ri > rj:
+                            ri, rj = rj, ri
+                        parent[rj] = ri
+        # 13 strictly forward neighbour cells: visits every adjacent cell pair once
         cand = []
-        for dx, dy, dz in offs:
-            other = cells.get((key[0] + dx, key[1] + dy, key[2] + dz))
+        for dx, dy, dz in fwd_offs:
+            other = cells.get((kx + dx, ky + dy, kz + dz))
             if other:
                 cand.extend(other)
-        if len(cand) < 2:
+        if not cand:
             continue
-        cand = np.asarray(cand)
         P = V[cand]
         for i in members:
             d2 = ((P - V[i]) ** 2).sum(axis=1)
-            for j in cand[(d2 <= tol2) & (cand != i)]:
-                ri, rj = find(i), find(int(j))
+            for off in np.nonzero(d2 <= tol2)[0].tolist():
+                ri, rj = find(i), find(cand[off])
                 if ri != rj:
-                    parent[max(ri, rj)] = min(ri, rj)
-    roots = np.array([find(i) for i in range(n)])
+                    if ri > rj:
+                        ri, rj = rj, ri
+                    parent[rj] = ri
+    roots = np.fromiter((find(i) for i in range(n)), dtype=np.int64, count=n)
     uniq, newidx = np.unique(roots, return_inverse=True)
     # merged position = position of the representative (keeps grid-exact coords)
     V2 = V[uniq]
@@ -155,16 +175,25 @@ def _dedup_faces(T):
     keep = np.ones(len(T), dtype=bool)
     dup_same = 0
     flap_pairs = 0
-    for g in np.nonzero(cnt > 1)[0]:
-        members = np.nonzero(inv == g)[0]
-        p = members[pos[members]]
-        m = members[~pos[members]]
-        if len(p) and len(m):
-            keep[members] = False          # back-to-back flap(s): remove all
-            flap_pairs += min(len(p), len(m))
-        else:
-            keep[members[1:]] = False      # exact duplicate: keep one
-            dup_same += len(members) - 1
+    dup_idx = np.nonzero(cnt[inv] > 1)[0]
+    if len(dup_idx):
+        dup_inv = inv[dup_idx]
+        order = np.argsort(dup_inv, kind="stable")
+        s_idx = dup_idx[order]
+        s_inv = dup_inv[order]
+        cuts = np.nonzero(s_inv[1:] != s_inv[:-1])[0] + 1
+        starts = np.r_[0, cuts]
+        ends = np.r_[cuts, len(s_idx)]
+        for a, b in zip(starts.tolist(), ends.tolist()):
+            members = s_idx[a:b]
+            p_cnt = int(pos[members].sum())
+            m_cnt = len(members) - p_cnt
+            if p_cnt and m_cnt:
+                keep[members] = False          # back-to-back flap(s): remove all
+                flap_pairs += min(p_cnt, m_cnt)
+            else:
+                keep[members[1:]] = False      # exact duplicate: keep one
+                dup_same += len(members) - 1
     return T[keep], dup_same, flap_pairs
 
 
@@ -178,40 +207,71 @@ def _boundary_halfedges(T):
 
 def _split_tjunctions(V, T, tol=TJUNC_TOL, max_iter=TJUNC_MAX_ITER):
     total = 0
+    tol2 = tol * tol
+    min_l2 = (2 * tol) ** 2
     for _ in range(max_iter):
         if len(T) == 0:
             break
         ea, eb, ef = _boundary_halfedges(T)
         if len(ea) == 0:
             break
-        bverts = np.unique(np.concatenate([ea, eb]))
         A = V[ea]
-        D = V[eb] - A
-        L2 = (D ** 2).sum(axis=1)
-        good = L2 > (2 * tol) ** 2
-        splits = {}   # face -> (local edge position, vertex)
-        # chunk over vertices to bound memory
+        B = V[eb]
+        D = B - A
+        L2 = (D * D).sum(axis=1)
+        good = L2 > min_l2
+        if not good.any():
+            break
+        ea, eb, ef = ea[good], eb[good], ef[good]
+        A, B, D, L2 = A[good], B[good], D[good], L2[good]
+        ln = np.sqrt(L2)
+        bverts = np.unique(np.concatenate([ea, eb]))
         P = V[bverts]
-        for s in range(0, len(bverts), 512):
-            Pc = P[s:s + 512]
-            W = Pc[:, None, :] - A[None, :, :]                # (nv, ne, 3)
-            t = (W * D[None]).sum(axis=2) / np.where(L2 > 0, L2, 1)[None]
-            proj = A[None] + t[..., None] * D[None]
-            dist2 = ((Pc[:, None, :] - proj) ** 2).sum(axis=2)
-            ln = np.sqrt(L2)[None]
-            inside = (t * ln > tol) & ((1 - t) * ln > tol)
-            hit = inside & (dist2 <= tol * tol) & good[None]
-            vi, ei = np.nonzero(hit)
-            for v_local, e in zip(vi, ei):
-                v = int(bverts[s + v_local])
-                if v == ea[e] or v == eb[e]:
+        order = np.argsort(P[:, 0])
+        bverts_s = bverts[order]
+        Ps = P[order]
+        Px = Ps[:, 0]
+        xlo = np.minimum(A[:, 0], B[:, 0]) - tol
+        xhi = np.maximum(A[:, 0], B[:, 0]) + tol
+        ylo = np.minimum(A[:, 1], B[:, 1]) - tol
+        yhi = np.maximum(A[:, 1], B[:, 1]) + tol
+        zlo = np.minimum(A[:, 2], B[:, 2]) - tol
+        zhi = np.maximum(A[:, 2], B[:, 2]) + tol
+        i0s = np.searchsorted(Px, xlo, side="left")
+        i1s = np.searchsorted(Px, xhi, side="right")
+        splits = {}   # face -> ((a, b), vertex, t)
+        ea_l, eb_l, ef_l = ea.tolist(), eb.tolist(), ef.tolist()
+        for e in range(len(ea_l)):
+            i0, i1 = int(i0s[e]), int(i1s[e])
+            if i0 >= i1:
+                continue
+            Pc = Ps[i0:i1]
+            m = ((Pc[:, 1] >= ylo[e]) & (Pc[:, 1] <= yhi[e])
+                 & (Pc[:, 2] >= zlo[e]) & (Pc[:, 2] <= zhi[e]))
+            if not m.any():
+                continue
+            idx = np.nonzero(m)[0]
+            W = Pc[idx] - A[e]
+            dot = W @ D[e]
+            t = dot / L2[e]
+            lne = ln[e]
+            inside = (t * lne > tol) & ((1.0 - t) * lne > tol)
+            if not inside.any():
+                continue
+            dist2 = (W * W).sum(axis=1) - dot * t
+            hit = inside & (dist2 <= tol2)
+            if not hit.any():
+                continue
+            ae, be, fe = ea_l[e], eb_l[e], ef_l[e]
+            for k in np.nonzero(hit)[0].tolist():
+                v = int(bverts_s[i0 + int(idx[k])])
+                if v == ae or v == be:
                     continue
-                f = int(ef[e])
-                tt = float(t[v_local, e])
-                prev = splits.get(f)
+                tt = float(t[k])
+                prev = splits.get(fe)
                 # per face, per iteration: split one edge, at the vertex closest to its start
-                if prev is None or (prev[0] == (int(ea[e]), int(eb[e])) and tt < prev[2]):
-                    splits[f] = ((int(ea[e]), int(eb[e])), v, tt)
+                if prev is None or (prev[0] == (ae, be) and tt < prev[2]):
+                    splits[fe] = ((ae, be), v, tt)
         if not splits:
             break
         keep = np.ones(len(T), dtype=bool)
@@ -286,12 +346,12 @@ def _fill_tiny_cracks(V, T, max_diag=CRACK_MAX_DIAG):
     return T2, filled, len(new)
 
 
-def _shells(T):
-    """Connected components of facets sharing an (undirected) edge."""
+def _shells_and_bad(T):
+    """Return (shell root per face, set of roots touching open or non-manifold edges)."""
     n = len(T)
-    parent = np.arange(n)
+    parent = list(range(n))
 
-    def find(x):
+    def find(x: int) -> int:
         while parent[x] != x:
             parent[x] = parent[parent[x]]
             x = parent[x]
@@ -302,30 +362,53 @@ def _shells(T):
     order = np.argsort(key, kind="stable")
     ks, fs = key[order], f[order]
     same = np.nonzero(ks[1:] == ks[:-1])[0]
-    for i in same:
-        ra, rb = find(int(fs[i])), find(int(fs[i + 1]))
+    fs_l = fs.tolist()
+    for i in same.tolist():
+        ra, rb = find(fs_l[i]), find(fs_l[i + 1])
         if ra != rb:
-            parent[max(ra, rb)] = min(ra, rb)
-    roots = np.array([find(i) for i in range(n)])
+            if ra > rb:
+                ra, rb = rb, ra
+            parent[rb] = ra
+    roots = np.fromiter((find(i) for i in range(n)), dtype=np.int64, count=n)
+    # Every face sharing an edge is in the same shell, so an edge's run length
+    # in the sorted global edge table equals its incidence count within its shell.
+    cuts = np.nonzero(ks[1:] != ks[:-1])[0] + 1
+    starts = np.r_[0, cuts]
+    ends = np.r_[cuts, len(ks)]
+    bad_runs = (ends - starts) != 2
+    bad_roots = set(roots[fs[starts[bad_runs]]].tolist()) if bad_runs.any() else set()
+    return roots, bad_roots
+
+
+def _shells(T):
+    """Connected components of facets sharing an (undirected) edge."""
+    roots, _ = _shells_and_bad(T)
     return roots
 
 
 def _flip_inverted_closed_shells(V, T):
     if len(T) == 0:
         return T, 0, []
-    roots = _shells(T)
+    roots, bad_roots = _shells_and_bad(T)
     flipped = 0
     log = []
     T = T.copy()
-    for r in np.unique(roots):
-        idx = np.nonzero(roots == r)[0]
+    order = np.argsort(roots, kind="stable")
+    sr = roots[order]
+    cuts = np.nonzero(sr[1:] != sr[:-1])[0] + 1
+    starts = np.r_[0, cuts]
+    ends = np.r_[cuts, len(sr)]
+    for a, b in zip(starts.tolist(), ends.tolist()):
+        r = int(sr[a])
+        if r in bad_roots:
+            continue
+        idx = order[a:b]
         sub = T[idx]
-        m = mesh_metrics(V, sub)
-        closed = m["open_edges"] == 0 and m["nonmanifold_edges"] == 0
-        if closed and m["volume"] < 0:
+        vol = signed_volume(V, sub)
+        if vol < 0:
             T[idx] = sub[:, [0, 2, 1]]
             flipped += 1
-            log.append(f"flipped closed shell of {len(idx)} facets (volume {m['volume']:.2f} mm3)")
+            log.append(f"flipped closed shell of {len(idx)} facets (volume {vol:.2f} mm3)")
     return T, flipped, log
 
 
@@ -333,14 +416,17 @@ def _flip_inverted_closed_shells(V, T):
 # public entry point
 # --------------------------------------------------------------------------
 
-def repair_mesh(V, T, name: str = "", report: dict | None = None):
+def repair_mesh(V, T, name: str = "", report: dict | None = None, *, metrics: bool = True):
     """Return (V, T, report) after the safe repair steps.
 
     ``V`` is (n,3) float mm, ``T`` is (m,3) int.  Output dtypes: float32/int32.
+    Set ``metrics=False`` when ``report is None`` and the caller does not read
+    the returned report's ``before``/``after`` metrics.
     """
     V = np.asarray(V, dtype=np.float64)
     T = np.asarray(T, dtype=np.int64)
-    before = mesh_metrics(V, T)
+    want_metrics = metrics or report is not None
+    before = mesh_metrics(V, T) if want_metrics else None
     V, T, merged = _merge_vertices(V, T, MERGE_TOL)
     T, degen = _drop_degenerate(V, T)
     T, dup_same, flaps = _dedup_faces(T)
@@ -354,8 +440,12 @@ def repair_mesh(V, T, name: str = "", report: dict | None = None):
     remap[used] = np.arange(len(used))
     V = V[used]
     T = remap[T]
-    after = mesh_metrics(V, T)
-    vb, va = before["volume"], after["volume"]
+    after = mesh_metrics(V, T) if want_metrics else None
+    if want_metrics:
+        vb, va = before["volume"], after["volume"]
+        vol_pct = (100.0 * (va - vb) / abs(vb)) if abs(vb) > 1e-9 else 0.0
+    else:
+        vol_pct = 0.0
     rep = {
         "name": name,
         "before": before,
@@ -368,7 +458,7 @@ def repair_mesh(V, T, name: str = "", report: dict | None = None):
         "cracks_filled": cracks,
         "crack_faces_added": crack_faces,
         "shells_flipped": shells_flipped,
-        "volume_change_pct": (100.0 * (va - vb) / abs(vb)) if abs(vb) > 1e-9 else 0.0,
+        "volume_change_pct": vol_pct,
         "log": log,
     }
     if report is not None:

@@ -8,7 +8,7 @@ the end is **not** verifiable by CLI slicing.
 
 ```
 brickprint profiles list
-brickprint profiles show a1mini-petg-008-lego --resolved --filament porima-petg-white
+brickprint profiles show a1mini-petg-008-lego-v8 --resolved --filament porima-petg-white
 brickprint profiles check            # read-only: installed Bambu user presets vs profiles
 brickprint profiles export porima-petg-white --to ~/Desktop/presets
 ```
@@ -28,9 +28,10 @@ brickprint profiles export porima-petg-white --to ~/Desktop/presets
 | profile | what |
 |---|---|
 | `a1mini-pla-stock` (default) | Bambu stock A1 mini 0.4 + PLA Basic + 0.20mm Standard from the checked-in snapshot. Output is byte-identical to brickprint before profiles existed. Supports go on `<Colour> supports` plates. |
-| `a1mini-petg-008-lego` | 0.08mm Extra Fine base, PETG Basic base filament, the Seagull v4 tuning: 4 walls, 6/5 shells, 50/100 mm/s walls, bridge 25 mm/s, `thick_bridges 0`, fit ±0.03, short-span bridging, enforcer-only supports with a 0.24 mm top gap. |
-| `a1mini-petg-008-lego-v8` | The profile above plus `ceilings recipe8` and `thick_bridges 1` (Seagull v8). Recommended for PETG. |
-| `porima-petg-white`, `porima-petg-neon-orange` | Porima PETG spools: 250/255 °C, bed 80, fan 20-30 %, overhang fan 100 %, flow 1.00/1.01, max 9/7 mm³/s. Manufacturer data: nozzle 240-260 °C, bed 60-80 °C, fan 100 %, drying 2-4 h at 30-40 °C (as published). Retraction, density, shrink and flow are not published. |
+| `a1mini-petg-008-lego` | 0.08mm Extra Fine base, PETG Basic base filament, the Seagull v4 tuning: 4 walls, 6/5 shells, 50/100 mm/s walls, bridge 25 mm/s, `thick_bridges 0`, fit ±0.03, short-span bridging, outer brim, enforcer-only supports with a 0.24 mm top gap. |
+| `a1mini-petg-008-lego-v8` | **Recommended for PETG.** Adds `ceilings recipe8` + `thick_bridges 1`, `brim_type no_brim` globally with `small-contact` per-object brims (<20 mm²), lighter enforcer supports (`support_top_z_distance 0.32`, 2 interface layers @ 0.5 mm), and per-part `59900` hole compensation `-0.08` (see Cleanup section below). |
+| Porima PETG opaque/natural (5): `porima-petg-white`, `porima-petg-black`, `porima-petg-blue-ral5015`, `porima-petg-natural`, `porima-petg-silver-ral7046` | 250 °C nozzle, 80 °C textured PEI bed, fan 20–30 %, overhang fan 100 %, flow 1.00, max 9 mm³/s. Manufacturer data: nozzle 240–260 °C, bed 60–80 °C, fan 100 %, drying 2–4 h at 30–40 °C (retraction, density, shrink, flow unpublished). |
+| Porima PETG neon/transparent (4): `porima-petg-neon-orange`, `porima-petg-transparent-neon-green`, `porima-petg-transparent-night-blue`, `porima-petg-transparent-wine-red` | 255 °C nozzle, 80 °C textured PEI bed, fan 20–30 %, overhang fan 100 %, flow 1.01, max 7 mm³/s. Same published Porima temperature/drying ranges. |
 
 How the settings are written (`brickprint/settings.py`):
 
@@ -276,7 +277,7 @@ Open the file in Bambu Studio and confirm these show:
 Expected (to be confirmed by this manual check; GUI behaviour has not been
 verified): the process shows as the stock preset with a "modified" mark and a
 re-save is not needed. If you do re-save, run `brickprint verify
-FILE --profile a1mini-petg-008-lego --fit 0.03` on the re-saved file.
+FILE --profile a1mini-petg-008-lego-v8 --fit 0.03` on the re-saved file.
 
 ## Cleanup: brim and per-part settings (`a1mini-petg-008-lego-v8`)
 

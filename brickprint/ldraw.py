@@ -117,25 +117,60 @@ class LDrawLibrary:
         self.root = Path(root)
         if not (self.root / "LDConfig.ldr").is_file():
             raise SystemExit(f"not an LDraw library: {self.root}")
-        self.files: dict[str, Path] = {}
-        self.by_base: dict[str, Path] = {}
-        for sub in ("parts", "parts/s", "p", "p/48", "p/8"):
-            base = self.root / sub
-            if not base.is_dir():
-                continue
-            for path in base.rglob("*.dat"):
-                rel = str(path.relative_to(base)).replace(os.sep, "/").lower()
-                self.files.setdefault(rel, path)
-                self.by_base.setdefault(path.name.lower(), path)
+        # Single-pass os.scandir over "parts" and "p" (never double-walking
+        # parts/s, p/48, p/8) while keeping the exact lookup precedence:
+        # parts -> parts/s -> p -> p/48 -> p/8.
+        self._files: dict[str, str] = {}
+        self._by_base: dict[str, str] = {}
+
+        def scan(base_dir: Path, alias_prefixes: tuple[str, ...]) -> None:
+            if not base_dir.is_dir():
+                return
+            aliases: dict[str, list[tuple[str, str]]] = {p: [] for p in alias_prefixes}
+            stack = [(str(base_dir), "")]
+            while stack:
+                cur, rel_prefix = stack.pop()
+                try:
+                    with os.scandir(cur) as it:
+                        for e in it:
+                            name = e.name
+                            if e.is_dir(follow_symlinks=False):
+                                stack.append((e.path, f"{rel_prefix}{name}/"))
+                            elif name.lower().endswith(".dat"):
+                                nl = name.lower()
+                                rel = f"{rel_prefix.lower()}{nl}"
+                                self._files.setdefault(rel, e.path)
+                                self._by_base.setdefault(nl, e.path)
+                                for ap in alias_prefixes:
+                                    if rel.startswith(ap):
+                                        aliases[ap].append((rel[len(ap):], e.path))
+                except OSError:
+                    continue
+            for ap in alias_prefixes:
+                for sub_rel, p in aliases[ap]:
+                    self._files.setdefault(sub_rel, p)
+
+        scan(self.root / "parts", ("s/",))
+        scan(self.root / "p", ("48/", "8/"))
+
+    @property
+    def files(self) -> dict[str, Path]:
+        return {k: Path(v) for k, v in self._files.items()}
+
+    @property
+    def by_base(self) -> dict[str, Path]:
+        return {k: Path(v) for k, v in self._by_base.items()}
 
     def find(self, name: str) -> Path | None:
         name = name.lower().strip()
         if not name.endswith(".dat"):
             name += ".dat"
-        if name in self.files:
-            return self.files[name]
+        hit = self._files.get(name)
+        if hit is not None:
+            return Path(hit)
         base = name.split("/")[-1]
-        return self.by_base.get(base)
+        hit = self._by_base.get(base)
+        return Path(hit) if hit is not None else None
 
     def moved_to(self, path: Path) -> str | None:
         try:
@@ -255,33 +290,59 @@ def _read_binary_stl(path: Path) -> tuple[np.ndarray, np.ndarray]:
     return V, T
 
 
-def _defects(V: np.ndarray, T: np.ndarray) -> tuple[int, int]:
-    """(non-manifold edges, open boundary components) of the repaired mesh."""
+def _repair_and_defects(V: np.ndarray, T: np.ndarray) -> tuple[int, int, np.ndarray, np.ndarray]:
+    """Repair ``(V, T)`` once and return ``(nonmanifold_edges, open_loops, V_rep, T_rep)``."""
     from . import repair
 
-    V, T, rep = repair.repair_mesh(V, T)
-    ea, eb, _ = repair._boundary_halfedges(T.astype(np.int64))
+    Vr, Tr, _ = repair.repair_mesh(V, T, metrics=False)
+    if len(Tr) == 0:
+        return 0, 0, Vr, Tr
+    T64 = Tr.astype(np.int64)
+    lo, hi, a, b, _ = repair._edge_table(T64)
+    ok = lo != hi
+    lo_ok, hi_ok, a_ok, b_ok = lo[ok], hi[ok], a[ok], b[ok]
+    key = lo_ok * (int(T64.max()) + 1) + hi_ok
+    _, inv, cnt = np.unique(key, return_inverse=True, return_counts=True)
+    nonmanifold = int((cnt > 2).sum())
+    open_mask = cnt[inv] == 1
+    ea, eb = a_ok[open_mask], b_ok[open_mask]
     holes = 0
     if len(ea):
-        verts, inv = np.unique(np.concatenate([ea, eb]), return_inverse=True)
-        parent = np.arange(len(verts))
+        verts, vinv = np.unique(np.concatenate([ea, eb]), return_inverse=True)
+        nv = len(verts)
+        parent = list(range(nv))
 
-        def find(x):
+        def find(x: int) -> int:
             while parent[x] != x:
                 parent[x] = parent[parent[x]]
                 x = parent[x]
             return x
 
-        for a, b in zip(inv[:len(ea)], inv[len(ea):]):
-            ra, rb = find(a), find(b)
+        ne = len(ea)
+        for u, v in zip(vinv[:ne].tolist(), vinv[ne:].tolist()):
+            ra, rb = find(u), find(v)
             if ra != rb:
-                parent[max(ra, rb)] = min(ra, rb)
-        holes = len({find(i) for i in range(len(verts))})
-    return rep["after"]["nonmanifold_edges"], holes
+                if ra > rb:
+                    ra, rb = rb, ra
+                parent[rb] = ra
+        holes = len({find(i) for i in range(nv)})
+    return nonmanifold, holes, Vr, Tr
+
+
+def _defects(V: np.ndarray, T: np.ndarray) -> tuple[int, int]:
+    """(non-manifold edges, open boundary components) of the repaired mesh."""
+    nm, holes, _, _ = _repair_and_defects(V, T)
+    return nm, holes
+
+
+# Last active MeshCache root in this process so ceilings.plan() can cache next
+# to .c2.json without changing callers' signatures.
+_ACTIVE_CACHE_ROOT: Path | None = None
 
 
 class MeshCache:
     def __init__(self, cfg: dict):
+        global _ACTIVE_CACHE_ROOT
         self.cfg = cfg
         self.ldraw = Path(cfg["ldraw_dir"])
         self.ldview = cfg.get("ldview", "")
@@ -290,6 +351,7 @@ class MeshCache:
         root = Path(cfg["cache_dir"]) / "meshes" / hashlib.sha1(key.encode()).hexdigest()[:12]
         root.mkdir(parents=True, exist_ok=True)
         self.root = root
+        _ACTIVE_CACHE_ROOT = root
 
     def __getstate__(self):
         # pickled into prepare() worker processes: only the plain paths are
@@ -298,6 +360,7 @@ class MeshCache:
         state["cfg"] = {k: self.cfg[k] for k in ("cache_dir", "ldraw_dir", "ldview")
                         if k in self.cfg}
         state.pop("_last_export", None)
+        state.pop("_last_repaired", None)
         return state
 
     def _path(self, part_file: str) -> Path:
@@ -308,16 +371,18 @@ class MeshCache:
         """Raw LDView mesh (cached as <part>.npz, never modified)."""
         path = self._path(part_file)
         if path.is_file():
-            d = np.load(path)
-            return d["V"], d["T"]
+            with np.load(path) as d:
+                return d["V"], d["T"]
         V, T = self._export(part_file)
-        _atomic_savez(path, V=V.astype(np.float32), T=T.astype(np.int32))
+        V32 = np.asarray(V, dtype=np.float32)
+        T32 = np.asarray(T, dtype=np.int32)
+        _atomic_savez(path, V=V32, T=T32)
         try:
             import json
             _atomic_write_text(path.with_suffix(".q.json"), json.dumps(self._last_export))
         except (OSError, AttributeError):
             pass
-        return V, T
+        return V32, T32
 
     def export_info(self, part_file: str) -> dict:
         """Which LDView geometry the cached mesh came from (written when the
@@ -338,14 +403,33 @@ class MeshCache:
 
         rpath = self._path(part_file).with_suffix(f".r{repair.REPAIR_VERSION}.npz")
         if rpath.is_file() and report is None:
-            d = np.load(rpath)
-            return d["V"], d["T"]
+            with np.load(rpath) as d:
+                return d["V"], d["T"]
+        self._last_repaired = None
         V, T = self.get_raw(part_file)
-        V, T, rep = repair.repair_mesh(V, T, part_file)
-        if report is not None:
-            report[part_file] = rep
-        _atomic_savez(rpath, V=V.astype(np.float32), T=T.astype(np.int32))
-        return V, T
+        reused = getattr(self, "_last_repaired", None)
+        self._last_repaired = None
+        if report is None and reused is not None and reused[0] == part_file:
+            Vr, Tr = reused[1], reused[2]
+        else:
+            Vr, Tr, rep = repair.repair_mesh(V, T, part_file, metrics=(report is not None))
+            if report is not None:
+                report[part_file] = rep
+        _atomic_savez(rpath, V=Vr.astype(np.float32), T=Tr.astype(np.int32))
+        return Vr, Tr
+
+    def _load_candidates(self, cpath: Path, tag: str) -> dict | None:
+        import json
+
+        if cpath.is_file():
+            try:
+                hit = json.loads(cpath.read_text())
+                if hit.get("tag") == tag:
+                    return {up: (np.array(c["R"], dtype=float), c["m"])
+                            for up, c in hit["cands"].items()}
+            except (ValueError, KeyError, OSError):
+                pass
+        return None
 
     def candidates(self, part_file: str, V: np.ndarray, T: np.ndarray, rot0: str) -> dict:
         """orient.candidates() (the slow emulator pass over the 6 up
@@ -355,11 +439,11 @@ class MeshCache:
 
         from . import orient
 
-        hit = self.cached_candidates(part_file, V, T, rot0)
-        if hit is not None:
-            return hit
         tag = f"{mesh_key(V, T)}:{rot0}"
         cpath = self._path(part_file).with_suffix(f".c{orient.ORIENT_VERSION}.json")
+        hit = self._load_candidates(cpath, tag)
+        if hit is not None:
+            return hit
         cands = orient.candidates(V, T, ROT[rot0])
         slim = {up: {"R": R.astype(int).tolist(),
                      "m": {k: (bool(m[k]) if k == "on_edge" else float(m[k]))
@@ -371,21 +455,11 @@ class MeshCache:
     def cached_candidates(self, part_file: str, V: np.ndarray, T: np.ndarray,
                           rot0: str) -> dict | None:
         """candidates() from the cache only: None on a miss (never computes)."""
-        import json
-
         from . import orient
 
         tag = f"{mesh_key(V, T)}:{rot0}"
         cpath = self._path(part_file).with_suffix(f".c{orient.ORIENT_VERSION}.json")
-        if cpath.is_file():
-            try:
-                hit = json.loads(cpath.read_text())
-                if hit.get("tag") == tag:
-                    return {up: (np.array(c["R"], dtype=float), c["m"])
-                            for up, c in hit["cands"].items()}
-            except (ValueError, KeyError):
-                pass
-        return None
+        return self._load_candidates(cpath, tag)
 
     def has_mesh(self, part_file: str) -> bool:
         """The repaired mesh is cached (get() will not run LDView / repair)."""
@@ -485,21 +559,30 @@ class MeshCache:
         """LDVIEW_GEOMETRY mesh, or LDVIEW_FALLBACK for the few parts where
         CurveQuality=6 is topologically worse than LDVIEW_BASELINE."""
         V, T = self._ldview(part_file, LDVIEW_GEOMETRY)
-        d = _defects(V, T)
+        V = V.astype(np.float32)
+        T = T.astype(np.int32)
+        nm, holes, Vr, Tr = _repair_and_defects(V, T)
+        d = (nm, holes)
         info = {"variant": "quality (CurveQuality=6, 48-gon)",
                 "defects": {"quality": {"nonmanifold": int(d[0]), "open_loops": int(d[1])}}}
         self._last_export = info
+        self._last_repaired = (part_file, Vr, Tr)
         if d == (0, 0):
             return V, T
-        base = _defects(*self._ldview(part_file, LDVIEW_BASELINE))
+        Vb, Tb = self._ldview(part_file, LDVIEW_BASELINE)
+        base = _defects(Vb.astype(np.float32), Tb.astype(np.int32))
         info["defects"]["baseline"] = {"nonmanifold": int(base[0]), "open_loops": int(base[1])}
         if d[0] <= base[0] and d[1] <= base[1]:
             return V, T
         Vf, Tf = self._ldview(part_file, LDVIEW_FALLBACK)
-        f = _defects(Vf, Tf)
+        Vf = Vf.astype(np.float32)
+        Tf = Tf.astype(np.int32)
+        fnm, fholes, Vfr, Tfr = _repair_and_defects(Vf, Tf)
+        f = (fnm, fholes)
         info["defects"]["fallback"] = {"nonmanifold": int(f[0]), "open_loops": int(f[1])}
         if f[0] <= base[0] and f[1] <= base[1]:
             info["variant"] = "fallback (CurveQuality=2, 16-gon)"
+            self._last_repaired = (part_file, Vfr, Tfr)
             return Vf, Tf
         info["variant"] = "quality (CurveQuality=6, 48-gon; all variants defective)"
         return V, T
@@ -527,6 +610,13 @@ class MeshCache:
                 detail = (proc.stderr or proc.stdout or "").strip().splitlines()
                 msg = detail[-1] if detail else f"LDView exit {proc.returncode}"
                 raise RuntimeError(f"LDView failed for {part_file}: {msg}")
+            with open(stl, "rb") as f:
+                head = f.read(84)
+            is_bin = (len(head) == 84
+                      and not head[:5].lower().startswith(b"solid")
+                      and 84 + 50 * struct.unpack("<I", head[80:84])[0] == stl.stat().st_size)
+            if is_bin:
+                return _read_binary_stl(stl)
             try:
                 return _read_ascii_stl(stl)
             except ValueError:

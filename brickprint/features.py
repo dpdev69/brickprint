@@ -50,14 +50,14 @@ def footprint_hull(V) -> np.ndarray:
 
 
 def _hull_distance(P: np.ndarray, H: np.ndarray) -> np.ndarray:
-    d = np.full(len(P), np.inf)
+    d2 = np.full(len(P), np.inf)
     for i in range(len(H)):
         a, b = H[i], H[(i + 1) % len(H)]
         ab = b - a
-        t = np.clip(((P - a) @ ab) / max(float(ab @ ab), 1e-12), 0, 1)
-        q = a + t[:, None] * ab
-        d = np.minimum(d, np.linalg.norm(P - q, axis=1))
-    return d
+        t = np.clip(((P - a) @ ab) / max(float(ab @ ab), 1e-12), 0.0, 1.0)
+        diff = P - (a + t[:, None] * ab)
+        d2 = np.minimum(d2, (diff * diff).sum(axis=1))
+    return np.sqrt(d2)
 
 
 def _clusters(T: np.ndarray, faces: np.ndarray) -> list[np.ndarray]:
@@ -88,8 +88,10 @@ def cantilever_boxes(V, T, protrusion: float = 0.8, margin: float = 0.2,
     if len(H) < 3:
         return []
     zmin0 = V[:, 2].min()
-    down = (nz < -1e-3) & (cen[:, 2] > zmin0 + MIN_Z)
-    cand = np.nonzero(down & ~orient._in_hull(cen[:, :2], H))[0]
+    down_idx = np.nonzero((nz < -1e-3) & (cen[:, 2] > zmin0 + MIN_Z))[0]
+    if not len(down_idx):
+        return []
+    cand = down_idx[~orient._in_hull(cen[down_idx, :2], H)]
     if not len(cand):
         return []
     dist = _hull_distance(cen[cand, :2], H)
@@ -184,6 +186,101 @@ def _rects(M: np.ndarray) -> list[tuple[int, int, int, int]]:
     return out
 
 
+def _flood_2d_free(free2d: np.ndarray) -> np.ndarray:
+    """Exact 4-connected reachability from boundary of a 2D bool slice via horizontal-run BFS."""
+    nx, ny = free2d.shape
+    padded = np.zeros((nx, ny + 2), dtype=np.int8)
+    padded[:, 1:-1] = free2d
+    diff = np.diff(padded, axis=1)
+    sr, sc = np.nonzero(diff == 1)
+    _, ec = np.nonzero(diff == -1)
+    nruns = len(sr)
+    if nruns == 0:
+        return np.zeros_like(free2d)
+    row_start = np.searchsorted(sr, np.arange(nx + 1)).tolist()
+    sr_l, sc_l, ec_l = sr.tolist(), sc.tolist(), ec.tolist()
+    vis = bytearray(nruns)
+    q = []
+    for idx in range(nruns):
+        r = sr_l[idx]
+        if r == 0 or r == nx - 1 or sc_l[idx] == 0 or ec_l[idx] == ny:
+            vis[idx] = 1
+            q.append(idx)
+    head = 0
+    while head < len(q):
+        u = q[head]
+        head += 1
+        r, c0, c1 = sr_l[u], sc_l[u], ec_l[u]
+        for nr in (r - 1, r + 1):
+            if 0 <= nr < nx:
+                lo, hi = row_start[nr], row_start[nr + 1]
+                for v in range(lo, hi):
+                    if ec_l[v] <= c0:
+                        continue
+                    if sc_l[v] >= c1:
+                        break
+                    if not vis[v]:
+                        vis[v] = 1
+                        q.append(v)
+    reach = np.zeros_like(free2d)
+    for idx in q:
+        reach[sr_l[idx], sc_l[idx]:ec_l[idx]] = True
+    return reach
+
+
+def _grow_rect_row(unc: np.ndarray, allowed: np.ndarray) -> tuple[int, int, int, int, int]:
+    """Grow a maximal rectangle inside ``allowed`` from the busiest uncovered row."""
+    nx, ny = unc.shape
+    r_seed = int(np.argmax(unc.sum(axis=1)))
+    a_row = allowed[r_seed]
+    d = np.diff(np.r_[0, a_row.astype(np.int8), 0])
+    starts = np.nonzero(d == 1)[0].tolist()
+    ends = np.nonzero(d == -1)[0].tolist()
+    best_run = (-1, 0, 0)
+    for c0, c1 in zip(starts, ends):
+        u_cnt = int(unc[r_seed, c0:c1].sum())
+        if u_cnt > best_run[0]:
+            best_run = (u_cnt, c0, c1)
+    _, ac0, ac1 = best_run
+    uj = np.nonzero(unc[r_seed, ac0:ac1])[0]
+    c0, c1 = ac0 + int(uj[0]), ac0 + int(uj[-1]) + 1
+    r0 = r_seed
+    while r0 > 0 and allowed[r0 - 1, c0:c1].all():
+        r0 -= 1
+    r1 = r_seed + 1
+    while r1 < nx and allowed[r1, c0:c1].all():
+        r1 += 1
+    while c0 > 0 and allowed[r0:r1, c0 - 1].all():
+        c0 -= 1
+    while c1 < ny and allowed[r0:r1, c1].all():
+        c1 += 1
+    return r0, r1, c0, c1, int(unc[r0:r1, c0:c1].sum())
+
+
+def _cover_with_dontcares(req: np.ndarray, allowed: np.ndarray) -> list[tuple[int, int, int, int]]:
+    """Cover every True cell of ``req`` with rectangles strictly inside ``allowed``.
+
+    ``req <= allowed`` is guaranteed.  Allows rectangles to overlap the part's
+    own solid material (``allowed & ~req``) while never touching external air
+    (``~allowed``), avoiding staircase explosion on curved cavities.
+    """
+    unc = req.copy()
+    rects = []
+    while unc.any():
+        ii, jj = np.nonzero(unc)
+        i0, i1, j0, j1 = int(ii.min()), int(ii.max()) + 1, int(jj.min()), int(jj.max()) + 1
+        if allowed[i0:i1, j0:j1].all():
+            rects.append((i0, i1, j0, j1))
+            break
+        r0, r1, c0, c1, cnt_r = _grow_rect_row(unc, allowed)
+        tc0, tc1, tr0, tr1, cnt_c = _grow_rect_row(unc.T, allowed.T)
+        if cnt_c > cnt_r:
+            r0, r1, c0, c1 = tr0, tr1, tc0, tc1
+        rects.append((r0, r1, c0, c1))
+        unc[r0:r1, c0:c1] = False
+    return rects
+
+
 def socket_blockers(V, T, layer: float = BLOCK_LAYER, px: float = BLOCK_PX) -> list[dict]:
     """Support-blocker boxes over the enclosed cavities of a posed part.
 
@@ -202,50 +299,48 @@ def socket_blockers(V, T, layer: float = BLOCK_LAYER, px: float = BLOCK_PX) -> l
     W = V - [0, 0, zmin]
     mask, px = orient.slice_stack(W, T, layer=layer, px=px)
     nx, ny, nl = mask.shape
-    x0, y0 = -0.5 + 0.0123 + W[:, 0].min(), -0.5 + 0.0071 + W[:, 1].min()
-    free = ~mask
-    reach = np.zeros_like(free)
-    reach[0, :, :] = free[0, :, :]
-    reach[-1, :, :] |= free[-1, :, :]
-    reach[:, 0, :] |= free[:, 0, :]
-    reach[:, -1, :] |= free[:, -1, :]
-    while True:
-        grow = reach.copy()
-        grow[1:] |= reach[:-1]
-        grow[:-1] |= reach[1:]
-        grow[:, 1:] |= reach[:, :-1]
-        grow[:, :-1] |= reach[:, 1:]
-        grow &= free
-        if np.array_equal(grow, reach):
-            break
-        reach = grow
-    enc = free & ~reach
-    # only cavities with something above them need blocking (an overhang)
-    roof = np.zeros_like(mask)
-    roof[:, :, :-1] = np.flip(np.logical_or.accumulate(np.flip(mask[:, :, 1:], 2), 2), 2)
-    enc &= roof
-    if enc.sum() * px * px < BLOCK_MIN_MM2:
-        return []
-    # a blocker may overlap the part's own material (nothing is supported
-    # there anyway): within the cavity's bbox, fill tubes / ribs so a socket
-    # is a few boxes, not a staircase around every tube
+    x0, y0 = orient.SLICE_X0 + W[:, 0].min(), orient.SLICE_Y0 + W[:, 1].min()
+    # Deduplicate identical 2D cross-sections before border flood-fill
+    mT = np.ascontiguousarray(mask.transpose(2, 0, 1))
+    enc_cache: dict[bytes, np.ndarray] = {}
+    encT = np.zeros_like(mT)
     for k in range(nl):
-        e = enc[:, :, k]
-        if e.any():
-            ii, jj = np.nonzero(e)
-            box = np.zeros_like(e)
-            box[ii.min():ii.max() + 1, jj.min():jj.max() + 1] = True
-            enc[:, :, k] = (e | mask[:, :, k]) & box
+        key = mT[k].tobytes()
+        e2d = enc_cache.get(key)
+        if e2d is None:
+            free2d = ~mT[k]
+            e2d = free2d & ~_flood_2d_free(free2d)
+            enc_cache[key] = e2d
+        encT[k] = e2d
+    # only cavities with something above them need blocking (an overhang)
+    roofT = np.zeros_like(mT)
+    roofT[:-1] = np.flip(np.logical_or.accumulate(np.flip(mT[1:], 0), 0), 0)
+    encT &= roofT
+    if encT.sum() * px * px < BLOCK_MIN_MM2:
+        return []
+    # A blocker may safely overlap the part's own solid material (nothing is
+    # supported there anyway), but must never enter external air (~allowed).
+    # Group consecutive Z layers into slabs while union(enc) <= intersection(allowed),
+    # then cover each slab's enclosed cells with minimal rectangles inside allowed.
+    allowedT = encT | mT
     boxes = []
     k = 0
     while k < nl:
-        if not enc[:, :, k].any():
+        if not encT[k].any():
             k += 1
             continue
+        slab_enc = encT[k].copy()
+        slab_all = allowedT[k].copy()
         k1 = k + 1
-        while k1 < nl and np.array_equal(enc[:, :, k1], enc[:, :, k]):
+        while k1 < nl and encT[k1].any():
+            nxt_enc = slab_enc | encT[k1]
+            nxt_all = slab_all & allowedT[k1]
+            if (nxt_enc & ~nxt_all).any():
+                break
+            slab_enc = nxt_enc
+            slab_all = nxt_all
             k1 += 1
-        for i0, i1, j0, j1 in _rects(enc[:, :, k]):
+        for i0, i1, j0, j1 in _cover_with_dontcares(slab_enc, slab_all):
             if (i1 - i0) * (j1 - j0) * px * px < 0.05:
                 continue
             boxes.append({"box": [round(float(x0 + i0 * px), 3), round(float(x0 + i1 * px), 3),
@@ -253,7 +348,7 @@ def socket_blockers(V, T, layer: float = BLOCK_LAYER, px: float = BLOCK_PX) -> l
                                   round(float(zmin + k * layer), 3),
                                   round(float(zmin + k1 * layer + BLOCK_UP), 3)]})
         k = k1
-    # stacked slabs of one cavity share their rectangles: merge in z
+    # stacked slabs sharing identical XY rectangles: merge in z
     merged: dict[tuple, list] = {}
     for b in sorted(boxes, key=lambda b: (b["box"][:4], b["box"][4])):
         key = tuple(b["box"][:4])
@@ -273,10 +368,13 @@ def ceiling_extent(V, T) -> tuple[float, float] | None:
     H = footprint_hull(V)
     if len(H) < 3:
         return None
-    m = (nz < -0.9) & (cen[:, 2] > V[:, 2].min() + MIN_Z) & orient._in_hull(cen[:, :2], H)
-    if not m.any():
+    down_idx = np.nonzero((nz < -0.9) & (cen[:, 2] > V[:, 2].min() + MIN_Z))[0]
+    if not len(down_idx):
         return None
-    P = V[np.unique(T[m])]
+    inside = orient._in_hull(cen[down_idx, :2], H)
+    if not inside.any():
+        return None
+    P = V[np.unique(T[down_idx[inside]])]
     ext = P.max(axis=0) - P.min(axis=0)
     return float(ext[0]), float(ext[1])
 
@@ -298,12 +396,14 @@ def stud_rings(V, T) -> list[dict]:
         return []
     # connected components (link 0.6 mm; 48-gon spacing is 0.31 mm, a
     # 2.0 mm fallback catches 8-gons), grid-hashed union-find: O(n)
+    px_l = P[:, 0].tolist()
+    py_l = P[:, 1].tolist()
+    n = len(P)
     out = []
     for link in (0.6, 2.0):
-        n = len(P)
-        parent = np.arange(n)
+        parent = list(range(n))
 
-        def find(x):
+        def find(x: int) -> int:
             while parent[x] != x:
                 parent[x] = parent[parent[x]]
                 x = parent[x]
@@ -313,15 +413,20 @@ def stud_rings(V, T) -> list[dict]:
         keys = np.floor(P / link).astype(np.int64)
         for i, (cx, cy) in enumerate(keys.tolist()):
             cells.setdefault((cx, cy), []).append(i)
+        link2 = link * link
         for (cx, cy), idx in cells.items():
             near = [j for dx in (-1, 0, 1) for dy in (-1, 0, 1) for j in cells.get((cx + dx, cy + dy), ())]
             for i in idx:
+                xi, yi = px_l[i], py_l[i]
                 for j in near:
-                    if j > i and (P[i, 0] - P[j, 0]) ** 2 + (P[i, 1] - P[j, 1]) ** 2 < link * link:
-                        ri, rj = find(i), find(j)
-                        if ri != rj:
-                            parent[ri] = rj
-        lab = np.array([find(i) for i in range(n)])
+                    if j > i:
+                        dx = xi - px_l[j]
+                        dy = yi - py_l[j]
+                        if dx * dx + dy * dy < link2:
+                            ri, rj = find(i), find(j)
+                            if ri != rj:
+                                parent[ri] = rj
+        lab = np.fromiter((find(i) for i in range(n)), dtype=np.int64, count=n)
         out = []
         for l in np.unique(lab):
             Q = P[lab == l]

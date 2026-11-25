@@ -1,28 +1,31 @@
 # brickprint
 
-Turn a LEGO set number into a color-grouped, multi-plate Bambu Studio project.
+Turn a LEGO set number (or local MOC BOM CSV) into a color-grouped, multi-plate
+Bambu Studio project.
 
 This skill was built and validated on LEGO **10337-1 Lamborghini Countach**:
-1,506 parts, 387 Rebrickable lots, 19 colors, **about 33-36 A1-mini plates** (depending on
-support plates and packing), all of which slice. It has also been exercised on a small second set (30314-1 Go-Kart
-Racer) to verify the generic path.
+1,506 parts, 387 Rebrickable lots, 19 colors, **about 33-36 A1-mini plates**
+(depending on support plates and packing), all of which slice. It has also been
+exercised on smaller sets (e.g. 30314-1 Go-Kart Racer) and tuned for LEGO clutch
+fit in PETG (`a1mini-petg-008-lego-v8`).
 
 ## Requirements
 
-- **macOS.** The default paths (`/Applications/BambuStudio.app`,
-  `/Applications/LDView.app`, `~/Library/Caches/brickprint`) and the launcher
-  (`bin/brickprint` looks for Blender under `/Applications`) assume macOS. The
-  code also accepts other paths through the config file or environment
-  variables, but only macOS has been exercised.
+- **macOS or Linux.** macOS is the primary target (`/Applications/BambuStudio.app`,
+  `/Applications/LDView.app`, `~/Library/Caches/brickprint`). Linux paths
+  (`${XDG_CACHE_HOME:-~/.cache}/brickprint`, `LDView`/`bambu-studio` on `PATH`
+  or standard prefixes) are supported and CI-tested on Ubuntu; custom paths can
+  be set via config or environment variables.
 - **Bambu Studio**, installed. Its command-line interface is used for the
-  slicing checks (floating-part probe, `--bambu` normalisation, `verify`).
-  Without it a build still runs but prints a warning that floating detection is
-  unverified.
+  slicing checks (floating-part probe, final-geometry check, plate check,
+  `--bambu` normalisation, `verify`) and for non-A1-mini `--preset` templates.
+  Without it an A1 mini build still runs using the numpy emulator only, printing
+  a warning that floating detection is unverified.
 - **LDView** and an **LDraw parts library**. Neither is bundled; see
   [Data sources and attribution](#data-sources-and-attribution). `brickprint
   bootstrap` can download the LDraw library; LDView you install yourself.
-- **Python 3.11+ with numpy.** The launcher prefers Blender's bundled Python
-  and falls back to `python3`; `BRICKPRINT_PYTHON` overrides it. See
+- **Python 3.9+ with numpy.** The launcher checks `$BRICKPRINT_PYTHON`, a local
+  `.venv`, Blender's bundled Python, and finally `python3`. See
   [Which Python runs it](#which-python-runs-it).
 
 ## Install
@@ -30,22 +33,30 @@ Racer) to verify the generic path.
 From a clone of this repository:
 
 ```bash
-./install.sh          # copy the skill into ~/.claude/skills/brickprint and ~/.codex/skills/brickprint
+./install.sh          # copy the skill into Antigravity, Codex, and Claude Code skill dirs
 ./install.sh --link   # symlink instead of copying (development)
 ```
 
-The installer backs up any existing copy under `~/Library/Caches/brickprint/backups`
-and writes `~/.config/brickprint/config.json` if it does not exist yet (an
-existing config is kept). The config holds `cache_dir`, `ldraw_dir`, `ldview`
-and `bambu`; `ldraw_dir` and `ldview` are written empty unless the installer
-finds them two folders above the skill, in `ldraw_library/ldraw` and
-`tools/LDView.app` (a layout of the author's own workspace, so normally they
-stay empty). brickprint then auto-detects them at run time (for example
-`/Applications/LDView.app`; at run time it also checks every parent folder of the
-skill for that `ldraw_library/ldraw` layout). You can also run
-`bin/brickprint` straight from the clone without installing.
+Targets installed:
 
-For development, `pip install -e ".[dev]"` installs a `brickprint` console script plus pytest and ruff; it must stay an editable/source-checkout install, because the bundled `assets/` live outside the package directory and a regular (non-editable) wheel would not contain them.
+- `~/.gemini/config/skills/brickprint` (Antigravity)
+- `~/.codex/skills/brickprint` (Codex)
+- `~/.claude/skills/brickprint` (Claude Code)
+
+The installer backs up any existing copy under `~/Library/Caches/brickprint/backups`
+(pruning older `brickprint.*` backups beyond `--keep-backups`, default 6) and
+writes `~/.config/brickprint/config.json` if it does not exist yet (an existing
+config is kept). The config holds `cache_dir`, `ldraw_dir`, `ldview`, and
+`bambu`, populated by checking environment overrides, ancestor workspace folders
+(`ldraw_library/ldraw`, `tools/LDView.app`), standard macOS/Linux install paths,
+and `PATH` (fields left empty are auto-detected at run time). You can also run
+`bin/brickprint` straight from the clone without installing, or symlink
+`bin/brickprint` onto your `PATH`.
+
+For development, `pip install -e ".[dev]"` installs a `brickprint` console script
+plus pytest and ruff; it must stay an editable/source-checkout install, because
+the bundled `assets/` live outside the package directory and a regular
+(non-editable) wheel would not contain them.
 
 Then check the setup and fix what is missing:
 
@@ -57,7 +68,8 @@ bin/brickprint bootstrap   # downloads the Rebrickable CSV dumps and, if no LDra
 `bootstrap` does not install LDView or Bambu Studio: install those yourself and
 run `doctor` again. To point brickprint at things in other places, edit
 `~/.config/brickprint/config.json` (keys `ldraw_dir`, `ldview`, `bambu`,
-`cache_dir`) or set environment variables, which take precedence over the config:
+`cache_dir`, `preset`) or set environment variables, which take precedence over
+the config:
 
 ```bash
 export BRICKPRINT_LDRAW=/path/to/ldraw          # folder with LDConfig.ldr, parts/, p/
@@ -70,36 +82,38 @@ export BRICKPRINT_BAMBU=/path/to/BambuStudio    # e.g. .../BambuStudio.app/Conte
 ```bash
 brickprint doctor     # or bin/brickprint ... from a clone
 brickprint inventory 10337-1
-brickprint build 10337-1 --bambu
+brickprint build 10337-1 --bambu --verify
+brickprint build 10337-1 --preset x1c --bambu --verify   # 256 mm printer (a1, p1s, x1c)
 brickprint validate *_parts_by_color.3mf
 brickprint verify *_parts_by_color.3mf
 
-# LEGO-clutch PETG (see SKILL.md for the full Seagull command; its input files are examples and are not in this repo)
-brickprint calibrate fit --profile a1mini-petg-008-lego-v8 --filament porima-petg-white --out fit_cal.3mf --verify
-brickprint build SET --profile a1mini-petg-008-lego-v8 --filament porima-petg-white --fit 0.03 --fit-test --verify
+# LEGO-clutch PETG (A1 mini)
+brickprint calibrate fit --profile a1mini-petg-008-lego-v8 --filament porima-petg-white --out fit_cal.3mf --bambu --verify
+brickprint build SET --profile a1mini-petg-008-lego-v8 --filament porima-petg-white --fit 0.03 --fit-test --bambu --verify
 ```
 
-If the skill is installed (`brickprint` is not put on your `PATH`; call the launcher by path or add a shell alias):
+If the skill is installed (`brickprint` is not put on your `PATH`; call the
+launcher by path or symlink it into `~/.local/bin/brickprint`):
 
 ```bash
-~/.codex/skills/brickprint/bin/brickprint doctor   # Codex
-~/.claude/skills/brickprint/bin/brickprint doctor  # Claude
+~/.gemini/config/skills/brickprint/bin/brickprint doctor   # Antigravity
+~/.claude/skills/brickprint/bin/brickprint doctor          # Claude Code
+~/.codex/skills/brickprint/bin/brickprint doctor           # Codex
 ```
 
 ### Which Python runs it
 
-brickprint needs Python 3.11+ **with numpy**. `bin/brickprint` picks, in order:
+brickprint needs Python 3.9+ **with numpy**. `bin/brickprint` picks, in order:
 
 1. `$BRICKPRINT_PYTHON`, if set;
-2. Blender 5.2's bundled `python3.13`
-   (`/Applications/Blender.app/Contents/Resources/5.2/python/bin/python3.13`);
-3. Blender 5.1's bundled `python3.11`;
+2. a local `.venv/bin/python` (or `.venv/bin/python3`) inside the skill root;
+3. the newest Blender bundled Python under
+   `/Applications/Blender.app/Contents/Resources/*/python/bin/python3*`;
 4. plain `python3`.
 
-The Blender interpreters are used because they ship numpy; a system or
-Homebrew `python3` often has none. That dependency is silent: if Blender is
-moved, upgraded to another version directory or removed, the launcher falls
-back to `python3`, and every command stops with
+The Blender interpreter is used as a convenience on macOS because it ships
+numpy, while system/Homebrew `python3` often has none. If no Blender or venv is
+present and `python3` lacks numpy, every command stops with
 `ERROR: numpy is not importable by this Python`. Fix it with
 `export BRICKPRINT_PYTHON=/path/to/python-with-numpy` (for example a venv with
 `pip install numpy`). `brickprint doctor` prints the interpreter in use
@@ -113,26 +127,30 @@ PYTHONPATH=. /Applications/Blender.app/Contents/Resources/5.2/python/bin/python3
 
 `verify` keeps its G-code in a `brickprint_verify_*` temp dir (the path is in
 the report; often 0.1-2.6 GB each), and an interrupted probe / plate check used
-to leave `probe_*` / `platecheck_*` / `final_*` dirs in the cache. `build` and
-`verify` now sweep these at start: dirs older than `sweep_days` (config, default
-3) go, then the oldest `brickprint_verify_*` dirs until they total at most
-`verify_keep_gb` (default 2). A dir with anything modified in the last hour is
-never touched (concurrent builds), nor a `--workdir` you passed. One line
-reports what was freed. Set `BRICKPRINT_NO_SWEEP=1` to turn it off.
+to leave `probe_*` / `platecheck_*` / `final_*` dirs in the cache. `build`,
+`calibrate`, and `verify` sweep these at start: dirs older than `sweep_days`
+(config, default 3) go, then the oldest `brickprint_verify_*` dirs until they
+total at most `verify_keep_gb` (default 2). A dir with anything modified in the
+last hour is never touched (concurrent builds), nor a `--workdir` you passed.
+One line reports what was freed. Set `BRICKPRINT_NO_SWEEP=1` to turn it off.
 
 ## What it generates
 
-- `<set>_<name>_parts_by_color.3mf` — one Bambu object per plate, one component
-  per part, one extruder per color, plate names `"<color> i of n"`.
+- `<set>_<name>_parts_by_color.3mf` — Bambu Studio project (one object per plate
+  on stock PLA; one object per part with `ceilings recipe8`; one object per
+  colour group on mixed plates), one extruder per color, plate names
+  `"<color> i of n"`.
 - `<set>_<name>_parts_by_color_plates.csv` — per-plate color, part count, size,
-  max Z, filament.
+  max Z, filament, support flag.
 - `<set>_<name>_parts_by_color_missing.csv` — lots with no LDraw geometry.
 - `<set>_<name>_parts_by_color_report.json` — completeness and validation.
+- `<set>_<name>_parts_by_color_quality.csv` — per-part mesh quality report (profile builds).
 
 The raw project (`_raw.3mf`) is written first. If Bambu Studio is installed,
-`--bambu` re-exports it to add plate thumbnails and Bambu's normalised
-metadata. This works with the Bambu Studio GUI open. The raw file is still a valid 3MF; it is expected to
-open in Bambu Studio (confirm with the manual GUI check in SKILL.md).
+`--bambu` re-exports it to add plate thumbnails and Bambu's normalised metadata.
+This works with the Bambu Studio GUI open. Without `--bambu` (the default), the
+raw file is copied as the output; it is still a valid 3MF expected to open in
+Bambu Studio (confirm with the manual GUI check in `references/print-tuning.md`).
 
 ## Pipeline
 
@@ -145,17 +163,21 @@ open in Bambu Studio (confirm with the manual GUI check in SKILL.md).
    assembled (studs-up) pose is kept unless it has floating/empty slicer layers
    or stands on an edge. Parts that still need support are put on separate
    `<Color> supports i of n` plates with tree supports enabled only there.
-4. **Packing** — parts are grouped by color and packed with MaxRects into
-   180 × 180 mm beds (6 mm margin, 1 mm gap).
+4. **Packing** — parts are grouped by color and packed with MaxRects into the
+   selected printer preset's bed (`a1mini`: 180×180 mm; `a1`/`p1s`/`x1c`:
+   256×256 mm, with the 18×28 mm front-left exclusion zone respected on P1S/X1C;
+   default 6 mm margin, 1 mm gap). `--mix-colours auto` (default) merges tiny
+   colour groups onto shared plates (≤4 colours/plate) only when needed to stay
+   within 36 plates; `--mix-colours always|off` overrides it.
 5. **3MF** — one model file per plate, globally unique object IDs, one component
    per part. Build items sit on Bambu's plate grid (`stride = bed × 1.2`,
    `cols = ceil(sqrt(plate_count))`, rows toward negative Y), which is what makes
    Bambu assign the right geometry to the right plate.
 6. **Print tuning** — optional profiles (`--profile`, `--filament`, `--fit`,
-   `--supports enforcers`, `--bridging short-span`); see
+   `--supports enforcers`, `--bridging short-span`, `--ceilings recipe8`); see
    `references/print-tuning.md`.
-7. **Bambu normalisation** — optional CLI `--export-3mf` pass for thumbnails and
-   project metadata.
+7. **Bambu normalisation** — optional CLI `--export-3mf` pass (`--bambu`) for
+   thumbnails and project metadata.
 8. **verify** — slice with the CLI and check effective settings, stud/socket
    toolpaths, supports and floating.
 
@@ -167,9 +189,14 @@ See `references/pipeline.md` for details.
 - Printed parts are simplified to the base mold when possible.
 - Minifigs are not expanded unless `--include-minifigs`; leg/torso assemblies
   often have no LDraw equivalent.
-- Parts larger than the usable bed are skipped and reported. Use a larger bed or
-  split the project.
-- One color per plate; very multicolored sets can produce many sparse plates.
+- Parts larger than the usable bed are skipped and reported. Use `--preset x1c`
+  (or larger `--bed/--depth`) or split the project.
+- One color per plate is the default whenever a set fits within 36 plates; pass
+  `--mix-colours always` to combine tiny colour groups (≤35% full, ≤4 colours
+  per plate).
+- Tuned PETG / LEGO-fit profiles (`a1mini-petg-*`) and Porima filament profiles
+  are calibrated for the A1 mini only; `--preset a1|p1s|x1c` use Bambu's stock
+  0.20 mm PLA preset chain.
 - LDraw footprints are 8·n mm (real LEGO 8·n − 0.2), and contour compensation
   grows them further. Neighbouring bricks can rub; `verify` reports the
   outer sizes. Mesh-level footprint relief is deliberately not implemented.
@@ -182,30 +209,37 @@ See `references/pipeline.md` for details.
 brickprint/
   SKILL.md                 agent instructions
   README.md
+  LICENSE, LICENSES/, THIRD_PARTY_NOTICES.md
+  pyproject.toml
   install.sh
   agents/openai.yaml
   bin/brickprint           launcher
   brickprint/
+    __main__.py            `python -m brickprint` entrypoint + numpy guard
     cli.py                 argument parsing, subcommand dispatch
     pipeline.py            build / verify / calibrate orchestration
     config.py              paths, printer presets (--preset), doctor
     rebrickable.py         CSV download + inventory
     ldraw.py               LDraw resolution + LDView mesh cache
-    pack.py                MaxRects packing
+    pack.py                MaxRects packing + --mix-colours
     threemf.py             3MF writer + validator
     settings.py            print profiles -> Bambu project settings
     bambu_profiles.py      Bambu stock preset chain resolution
-    features.py            enforcer volumes, bridge angles, stud rings
+    features.py            enforcer volumes, socket blockers, bridge angles, stud rings
+    ceilings.py            socket-ceiling recipe8 (raise, bands, ribs)
     quality.py             per-part mesh quality report
     gcode.py               G-code config/toolpath reader
     verify.py              slice + check effective settings and fit
     probe.py, orient.py, repair.py   floating probe, orientation, mesh repair
+    slice_cache.py         shared per-plate content-addressed G-code cache
+    sweep.py               work-dir disk cleanup
     net.py                 urllib/curl/wget download helper
   assets/
     a1mini_pla_project_settings.json   default profile snapshot
     profiles/process/*.json            process profiles
     profiles/filament/*.json           filament (spool) profiles
   references/
+  tests/
 ```
 
 ## Data sources and attribution

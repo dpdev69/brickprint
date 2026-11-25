@@ -6,6 +6,7 @@ import json
 import os
 import platform
 import shutil
+import threading
 from pathlib import Path
 
 SKILL_ROOT = Path(__file__).resolve().parent.parent
@@ -127,9 +128,13 @@ def _derive_settings(cfg: dict, name: str) -> Path:
     except SystemExit as e:      # bp.resolve: "Bambu preset not found: ..."
         raise SystemExit(f"preset {name}: Bambu Studio {version} lacks a stock profile ({e}){hint}")
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(text)
-    os.replace(tmp, path)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        tmp.write_text(text)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     return path
 
 
@@ -270,21 +275,15 @@ def load_config(preset: str | None = None) -> dict:
             cfg["ldraw_dir"] = str(Path(cfg["ldraw_dir"]).parent)
 
     if not cfg.get("ldview"):
-        candidates = [
+        cfg["ldview"] = _first_file(
             project / "tools" / "LDView.app" / "Contents" / "MacOS" / "LDView" if project else "",
             "/Applications/LDView.app/Contents/MacOS/LDView",
-            shutil.which("LDView") or "",
-            shutil.which("ldview") or "",
-        ]
-        cfg["ldview"] = _first_file(*candidates)
+        ) or _first_file(shutil.which("LDView") or "", shutil.which("ldview") or "")
 
     if not cfg.get("bambu"):
-        candidates = [
+        cfg["bambu"] = _first_file(
             "/Applications/BambuStudio.app/Contents/MacOS/BambuStudio",
-            shutil.which("BambuStudio") or "",
-            shutil.which("bambu-studio") or "",
-        ]
-        cfg["bambu"] = _first_file(*candidates)
+        ) or _first_file(shutil.which("BambuStudio") or "", shutil.which("bambu-studio") or "")
 
     cfg["cache_dir"] = str(Path(cfg["cache_dir"]).expanduser())
 

@@ -51,15 +51,18 @@ def xml_escape(text) -> str:
     return _sax_escape(str(text), {'"': "&quot;"})
 
 
-def _mesh_object(oid: int, V: np.ndarray, T: np.ndarray) -> str:
-    verts = "".join(
+def _mesh_body(V: np.ndarray, T: np.ndarray) -> str:
+    verts = "".join([
         f'<vertex x="{x:.4f}" y="{y:.4f}" z="{z:.4f}"/>' for x, y, z in V.tolist()
-    )
-    tris = "".join(f'<triangle v1="{a}" v2="{b}" v3="{c}"/>' for a, b, c in T.tolist())
-    return (
-        f'<object id="{oid}" p:UUID="{uuid.uuid4()}" type="model">'
-        f'<mesh><vertices>{verts}</vertices><triangles>{tris}</triangles></mesh></object>'
-    )
+    ])
+    tris = "".join([f'<triangle v1="{a}" v2="{b}" v3="{c}"/>' for a, b, c in T.tolist()])
+    return f'<mesh><vertices>{verts}</vertices><triangles>{tris}</triangles></mesh>'
+
+
+def _mesh_object(oid: int, V: np.ndarray, T: np.ndarray, body: str | None = None) -> str:
+    if body is None:
+        body = _mesh_body(V, T)
+    return f'<object id="{oid}" p:UUID="{uuid.uuid4()}" type="model">{body}</object>'
 
 
 def _support_metadata(plate: dict, cfg: dict | None = None) -> str:
@@ -204,6 +207,7 @@ def write_project(
     meshes: dict[str, dict],
     out_path: Path,
     verdict: bool = False,
+    compresslevel: int | None = None,
 ) -> Path:
     """Write the multi-plate project.
 
@@ -212,7 +216,8 @@ def write_project(
     part frame); objects that use either get Bambu ``<part>`` entries for every
     component, in component order.  ``verdict=True`` writes the supports-off
     copy used for Bambu's floating checks (Bambu stops reporting floating
-    regions when supports are enabled).
+    regions when supports are enabled).  ``compresslevel`` defaults to 1 for
+    ephemeral probe/verdict projects and 6 for final user projects.
     """
     if len(plates) > 36:
         raise SystemExit(f"too many plates ({len(plates)}); Bambu's plate grid supports 36")
@@ -222,10 +227,12 @@ def write_project(
     per_part = composer(cfg).ceilings_mode != "off"
     # support blockers over enclosed cavities (sockets, tubes) of every part
     # in an object with automatic supports; profile builds only (the stock
-    # PLA output stays byte-identical)
+    # PLA output stays byte-identical).  Kept in verdict=True as well so
+    # support plates match verify.supports_off_copy and keep sockets clear.
     blockers = not composer(cfg).legacy
     slots = _slots(plates)
     color_ids = [s["color_id"] for s in slots]
+    color_slot = {cid: i + 1 for i, cid in enumerate(color_ids)}
     if len(color_ids) > int(cfg.get("max_filaments", 32)):
         raise SystemExit(
             f"set needs {len(color_ids)} filament colours, above the configured "
@@ -306,7 +313,19 @@ def write_project(
     margin = float(cfg["margin"])
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+    if compresslevel is None:
+        compresslevel = 1 if (verdict or set_info.get("set_num") == "probe") else 6
+    mesh_body_cache: dict[tuple[str, str], str] = {}
+
+    def cached_mesh(kind: str, fn: str, oid: int, V, T) -> str:
+        key = (kind, fn)
+        body = mesh_body_cache.get(key)
+        if body is None:
+            body = _mesh_body(np.asarray(V), np.asarray(T))
+            mesh_body_cache[key] = body
+        return _mesh_object(oid, V, T, body=body)
+
+    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED, compresslevel=compresslevel) as z:
         z.writestr("[Content_Types].xml", CONTENT_TYPES)
         z.writestr("_rels/.rels", ROOT_RELS)
         z.writestr("Metadata/slice_info.config", SLICE_INFO)
@@ -315,18 +334,18 @@ def write_project(
         for pi, plate in enumerate(plates):
             mids = plate_parts[pi]
             entries = [
-                _mesh_object(mids[fn], meshes[fn]["V"], meshes[fn]["T"])
+                cached_mesh("part", fn, mids[fn], meshes[fn]["V"], meshes[fn]["T"])
                 for fn in mids
             ]
             for fn, eid in plate_enf[pi].items():
                 EV, ET = meshes[fn]["enforcer"]
-                entries.append(_mesh_object(eid, np.asarray(EV), np.asarray(ET)))
+                entries.append(cached_mesh("enf", fn, eid, EV, ET))
             for fn, rid in plate_rib[pi].items():
                 RV, RT = meshes[fn]["rib"]
-                entries.append(_mesh_object(rid, np.asarray(RV), np.asarray(RT)))
+                entries.append(cached_mesh("rib", fn, rid, RV, RT))
             for fn, bid in plate_blk[pi].items():
                 BV, BT = meshes[fn]["blocker"]
-                entries.append(_mesh_object(bid, np.asarray(BV), np.asarray(BT)))
+                entries.append(cached_mesh("blk", fn, bid, BV, BT))
             z.writestr(f"3D/Objects/plate_{pi + 1:02d}.model", _plate_model(entries))
 
         resources, build, objects, plate_xml = [], [], [], []
@@ -336,7 +355,7 @@ def write_project(
         for pi, plate in enumerate(plates):
             bx = (pi % cols) * stride_x
             by = -(pi // cols) * stride_y
-            extruder = color_ids.index(plate["color_id"]) + 1
+            extruder = color_slot[plate["color_id"]]
             plate_name = _plate_name(plate)
             instances = []
             for oi, obj in enumerate(plate_objs[pi]):
@@ -419,7 +438,7 @@ def write_project(
                                        for k, v in meta.items())
                 objects.append(
                     f'<object id="{oid}"><metadata key="name" value="{xml_escape(obj["name"])}"/>'
-                    f'<metadata key="extruder" value="{color_ids.index(obj["color_id"]) + 1 if "color_id" in obj else extruder}"/>'
+                    f'<metadata key="extruder" value="{color_slot[obj["color_id"]] if "color_id" in obj else extruder}"/>'
                     f'{meta_xml}{"".join(parts)}</object>'
                 )
                 if oi == 0:
@@ -482,20 +501,29 @@ def validate_project(path: Path, bed: float, depth: float) -> dict:
     """Parse the generated project and check every plate's world bbox."""
     import xml.etree.ElementTree as ET
 
-    z = zipfile.ZipFile(path)
     ns = {"c": "http://schemas.microsoft.com/3dmanufacturing/core/2015/02"}
     mesh = {}
-    for name in [n for n in z.namelist() if n.startswith("3D/Objects/")]:
-        root = ET.fromstring(z.read(name))
-        for obj in root.findall(".//c:object", ns):
-            vs = obj.findall(".//c:vertex", ns)
-            V = np.array([[float(v.get("x")), float(v.get("y")), float(v.get("z"))] for v in vs])
-            mesh[(name, obj.get("id"))] = (
-                V.min(axis=0),
-                V.max(axis=0),
-                len(obj.findall(".//c:triangle", ns)),
-            )
-    root = ET.fromstring(z.read("3D/3dmodel.model"))
+    with zipfile.ZipFile(path) as z:
+        for name in [n for n in z.namelist() if n.startswith("3D/Objects/")]:
+            root = ET.fromstring(z.read(name))
+            res_el = root.find("c:resources", ns)
+            objs = res_el.findall("c:object", ns) if res_el is not None else root.findall(".//c:object", ns)
+            for obj in objs:
+                m_el = obj.find("c:mesh", ns)
+                vs_el = m_el.find("c:vertices", ns) if m_el is not None else None
+                ts_el = m_el.find("c:triangles", ns) if m_el is not None else None
+                vs = vs_el if vs_el is not None else obj.findall(".//c:vertex", ns)
+                xs = [float(v.attrib["x"]) for v in vs]
+                ys = [float(v.attrib["y"]) for v in vs]
+                zs = [float(v.attrib["z"]) for v in vs]
+                ntris = len(ts_el) if ts_el is not None else len(obj.findall(".//c:triangle", ns))
+                mesh[(name, obj.attrib["id"])] = (
+                    np.array([min(xs), min(ys), min(zs)], dtype=np.float64),
+                    np.array([max(xs), max(ys), max(zs)], dtype=np.float64),
+                    ntris,
+                )
+        root = ET.fromstring(z.read("3D/3dmodel.model"))
+        ms = ET.fromstring(z.read("Metadata/model_settings.config"))
     plate_comps = {}
     for obj in root.findall(".//c:object", ns):
         comps = []
@@ -513,7 +541,6 @@ def validate_project(path: Path, bed: float, depth: float) -> dict:
     for it in root.findall(".//c:build/c:item", ns):
         tr = [float(x) for x in (it.get("transform") or "1 0 0 0 1 0 0 0 1 0 0 0").split()]
         items[it.get("objectid")] = np.array(tr[9:12])
-    ms = ET.fromstring(z.read("Metadata/model_settings.config"))
     n_plates = len(ms.findall("plate"))
     cols = math.ceil(math.sqrt(max(n_plates, 1)))
     enforcer_ids = {p.get("id") for p in ms.iter("part") if p.get("subtype") != "normal_part"}
@@ -533,7 +560,8 @@ def validate_project(path: Path, bed: float, depth: float) -> dict:
             T = np.array(tr).reshape(4, 3)
             R, tv = T[:3, :3], T[3, :]
             corners = np.array([[x, y, z] for x in (mn[0], mx[0]) for y in (mn[1], mx[1]) for z in (mn[2], mx[2])])
-            W = corners @ R.T + tv
+            # 3MF Core Spec §3.3: 4x3 row-vector transform [x y z 1] * M -> corners @ R + tv
+            W = corners @ R + tv
             if oid in items:
                 W = W + (items[oid] - origin)
             lo = np.minimum(lo, W.min(axis=0))
@@ -554,7 +582,7 @@ def validate_project(path: Path, bed: float, depth: float) -> dict:
             "size": [float(x) for x in size],
             "min": [float(x) for x in lo],
             "triangles": tris,
-            "ok": ok,
+            "ok": bool(ok),
         })
     return {
         "plates": plates,

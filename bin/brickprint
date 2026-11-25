@@ -1,17 +1,45 @@
 #!/usr/bin/env bash
 # Launcher for the brickprint package.  Set BRICKPRINT_PYTHON to override.
+# Compatible with bash 3.2 (macOS /bin/bash).
 set -euo pipefail
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Resolve symlinks so symlinking bin/brickprint onto PATH works.
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+    DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+HERE="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
 export PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}"
 
+find_blender_python() {
+    local base="/Applications/Blender.app/Contents/Resources"
+    [[ -d "$base" ]] || return 0
+    local ver cand
+    while IFS= read -r ver; do
+        [[ -n "$ver" && -d "$base/$ver/python/bin" ]] || continue
+        for cand in "$base/$ver"/python/bin/python3.[0-9]* "$base/$ver/python/bin/python3"; do
+            [[ -f "$cand" && -x "$cand" ]] || continue
+            case "$cand" in
+                *-config) continue ;;
+            esac
+            printf '%s' "$cand"
+            return 0
+        done
+    done < <(ls -1 "$base" 2>/dev/null | grep -E '^[0-9]+(\.[0-9]+)*$' | sort -t. -k1,1nr -k2,2nr -k3,3nr || true)
+}
+
+PY=""
 if [[ -n "${BRICKPRINT_PYTHON:-}" ]]; then
     PY="$BRICKPRINT_PYTHON"
-elif [[ -x /Applications/Blender.app/Contents/Resources/5.2/python/bin/python3.13 ]]; then
-    PY=/Applications/Blender.app/Contents/Resources/5.2/python/bin/python3.13
-elif [[ -x /Applications/Blender.app/Contents/Resources/5.1/python/bin/python3.11 ]]; then
-    PY=/Applications/Blender.app/Contents/Resources/5.1/python/bin/python3.11
+elif [[ -x "$HERE/.venv/bin/python" ]]; then
+    PY="$HERE/.venv/bin/python"
+elif [[ -x "$HERE/.venv/bin/python3" ]]; then
+    PY="$HERE/.venv/bin/python3"
 else
-    PY=python3
+    PY="$(find_blender_python)"
+    [[ -n "$PY" ]] || PY="python3"
 fi
 
 exec "$PY" -m brickprint "$@"

@@ -17,7 +17,20 @@ from pathlib import Path
 
 import numpy as np
 
-from . import ceilings, config, features, ldraw, pack, probe, quality, rebrickable, settings, sweep, threemf
+from . import (
+    ceilings,
+    config,
+    features,
+    ldraw,
+    pack,
+    probe,
+    quality,
+    rebrickable,
+    settings,
+    slice_cache,
+    sweep,
+    threemf,
+)
 
 # plate check: re-check rounds after per-object supports were added
 PLATE_CHECK_ROUNDS = 4
@@ -161,20 +174,23 @@ def _normalise_with_bambu(cfg, raw_path: Path, out_path: Path) -> bool:
     ]
     print("Bambu: " + " ".join(cmd))
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-    except subprocess.TimeoutExpired:
-        print("Bambu export timed out; leaving the raw 3MF.")
-        return False
-    produced = outdir / out_path.name
-    if proc.returncode != 0 or not produced.is_file():
-        tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-3:]
-        print("Bambu export failed; leaving the raw 3MF.")
-        for line in tail:
-            print("  " + line)
-        return False
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(produced, out_path)
-    return True
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+        except subprocess.TimeoutExpired:
+            print("Bambu export timed out; leaving the raw 3MF.")
+            return False
+        produced = outdir / out_path.name
+        if proc.returncode != 0 or not produced.is_file():
+            tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-3:]
+            print("Bambu export failed; leaving the raw 3MF.")
+            for line in tail:
+                print("  " + line)
+            return False
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(produced, out_path)
+        return True
+    finally:
+        shutil.rmtree(outdir, ignore_errors=True)
 
 
 def run_bootstrap(args):
@@ -255,7 +271,7 @@ def _apply_options(cfg, args) -> None:
     cfg["_composer"] = None
 
 
-def _prepare_meshes(cfg, unique_files, overrides, use_probe: bool, cache=None):
+def _prepare_meshes(cfg, unique_files, overrides, use_probe: bool, cache=None, vcache=None):
     """Repaired meshes -> Bambu floating probe -> print orientation.
 
     Returns (meshes, probe_report, bambu)."""
@@ -285,8 +301,8 @@ def _prepare_meshes(cfg, unique_files, overrides, use_probe: bool, cache=None):
         print(UNVERIFIED_BANNER.format(why="Bambu Studio not found"))
         probe_report["skipped"] = "Bambu Studio not found"
     else:
-        verdicts, pstats = probe.probe(
-            cfg, prepared, probe.VerdictCache(_verdict_root(cfg, cache.root)), bambu)
+        vc = vcache if vcache is not None else probe.VerdictCache(_verdict_root(cfg, cache.root))
+        verdicts, pstats = probe.probe(cfg, prepared, vc, bambu)
         probe_report = {"used": True, **pstats}
         print(f"probe: {pstats['parts_verified']}/{pstats['parts']} parts verified by "
               f"Bambu Studio ({pstats['cached']} poses cached, {pstats['probed']} probed, "
@@ -338,6 +354,7 @@ def _apply_features(cfg, meshes) -> dict:
            "ceiling_parts": {}}
     sp = prof.get("supports") or {}
     br = prof.get("bridging") or {}
+    default_bridge_angle = float(comp.process_overrides().get("bridge_angle", 0) or 0)
     for pf, m in sorted(meshes.items()):
         if comp.supports_mode == "enforcers":
             boxes = features.cantilever_boxes(
@@ -354,8 +371,7 @@ def _apply_features(cfg, meshes) -> dict:
                 out["bridge_angles"][pf] = ang
         if comp.ceilings_mode == "recipe8":
             # after the bridge angle: ribs run perpendicular to the strands
-            ang = float((m.get("part_meta") or {}).get("bridge_angle")
-                        or comp.process_overrides().get("bridge_angle", 0) or 0)
+            ang = float((m.get("part_meta") or {}).get("bridge_angle") or default_bridge_angle)
             p = ceilings.plan(m["V"], m["T"], ang)
             m["V"] = np.asarray(p["V"], dtype=float)
             if p["bands"]:
@@ -687,11 +703,19 @@ def run_build(args):
                                         relationships, part_map)
 
     cache = ldraw.MeshCache(cfg)
+    vcache = probe.VerdictCache(_verdict_root(cfg, cache.root))
     unique_files = sorted({m["part_file"] for m in merged} | set(test_files))
-    meshes, probe_report, bambu = _prepare_meshes(cfg, unique_files, overrides, args.probe, cache)
+    meshes, probe_report, bambu = _prepare_meshes(cfg, unique_files, overrides, args.probe,
+                                                  cache, vcache=vcache)
     feats = _apply_features(cfg, meshes) if not comp.legacy else {}
     if feats and probe_report.get("used"):
-        vcache = probe.VerdictCache(_verdict_root(cfg, cache.root))
+        # Batch ribbed and non-support parts into ONE initial check_final pass
+        # (warms vcache so _check_ribs only re-slices flagged ribbed suspects
+        # bare, and _screen_final hits vcache for every unchanged part).
+        combined = {pf: {**m, "file": pf} for pf, m in meshes.items()
+                    if not m["needs_support"] or m.get("rib") is not None}
+        if combined:
+            probe.check_final(cfg, bambu, combined, vcache, runs=probe.CONFIRM_RUNS)
         _check_ribs(cfg, bambu, meshes, feats, vcache)
         _screen_final(cfg, bambu, meshes, feats, vcache)
     needs_support = sorted(f for f, m in meshes.items() if m["needs_support"])
@@ -772,7 +796,12 @@ def run_build(args):
         f"{set_info['set_num']}_{slugify(set_info['name'])}_parts_by_color.3mf"
     )
     raw_path = out_path.with_name(out_path.stem + "_raw.3mf")
-    threemf.write_project(cfg, set_info, plates, meshes, raw_path)
+    # For profile builds with probe enabled, plate_check slices a separate
+    # supports-off _verdict.3mf, so avoid writing raw_path before plate_check.
+    raw_written = False
+    if not probe_report.get("used") or comp.legacy:
+        threemf.write_project(cfg, set_info, plates, meshes, raw_path)
+        raw_written = True
 
     # 4. whole-project check: parts that are clean alone can still be flagged
     #    once packed (and Bambu's check is not deterministic).  A floating
@@ -795,6 +824,7 @@ def run_build(args):
         if check_path != raw_path:
             plate_check["supports_off_copy"] = True
         fixed = []
+        raw_dirty = False
         for rnd in range(PLATE_CHECK_ROUNDS):
             flagged = probe.plate_check(cfg, bambu, check_path)
             errs = flagged.pop("errors", {})
@@ -824,6 +854,7 @@ def run_build(args):
                     # object: the plate as before
                     plate["support"] = "slice-check"
                     fixed.append(pid)
+                    raw_dirty = True
                     print(f"plate check: plate {pid} ({pack.plate_name(plate)}) floats on the full "
                           f"plate ({msg[:60]}...); enabling supports on that plate")
                     continue
@@ -832,6 +863,7 @@ def run_build(args):
                     if not meshes[pf]["needs_support"]:
                         meshes[pf]["needs_support"] = True
                         moved.append(pf)
+                        raw_dirty = True
                         print(f"plate check: plate {pid} ({pack.plate_name(plate)}): {pf} floats "
                               f"({one[:60]}...); moving that part type to the support plates")
             if not moved or rnd == PLATE_CHECK_ROUNDS - 1:
@@ -843,9 +875,13 @@ def run_build(args):
             plates, oversized = layout()
             threemf.write_project(cfg, set_info, plates, meshes, check_path,
                                   verdict=check_path != raw_path)
+            if check_path == raw_path:
+                raw_written = True
+                raw_dirty = False
         plate_check["supports_enabled"] = fixed
         needs_support = sorted(f for f, m in meshes.items() if m["needs_support"])
-        threemf.write_project(cfg, set_info, plates, meshes, raw_path)
+        if not raw_written or raw_dirty:
+            threemf.write_project(cfg, set_info, plates, meshes, raw_path)
         if check_path != raw_path:
             try:
                 check_path.unlink()
@@ -963,10 +999,13 @@ def _run_verify(cfg, path: Path, plates, reference, tol, workdir: Path | None,
     if expected is None:
         expected = _expected(cfg) if cfg.get("_composer") is not None else {}
     # the supports-off slice runs beside the file's own slice unless the
-    # machine is configured for one Bambu run at a time (probe_workers 1)
+    # machine is configured for one Bambu run at a time (probe_workers 1);
+    # per-plate G-code from plate_check / earlier verify runs is reused via
+    # the shared content-addressed G-code cache.
     res = verify.run(Path(path), bambu, plates=plates, reference=reference, tol=tol,
                      workdir=workdir, expected=expected,
-                     concurrent=probe.default_workers(cfg) > 1)
+                     concurrent=probe.default_workers(cfg) > 1,
+                     gcode_cache=slice_cache.default_dir(cfg))
     verify.print_summary(res)
     if report is not None:
         out = Path(report)
@@ -990,15 +1029,21 @@ def run_verify(args):
     if args.profile or args.fit or args.set_kv:
         _apply_options(cfg, args)
         expected = _expected(cfg)
-    elif rep.is_file() and json.loads(rep.read_text()).get("settings"):
-        s = json.loads(rep.read_text())["settings"]
-        cfg.update({"profile": s["profile"], "fit": f"{s['fit']['contour']},{s['fit']['hole']}",
-                    "set": [f"{k}={v}" for k, v in s.get("set", {}).items()],
-                    "support_set": [f"{k}={v}" for k, v in s.get("support_set", {}).items()],
-                    "supports": s.get("supports"), "bridging": s.get("bridging"),
-                    "filaments": [], "_composer": None})
-        expected = _expected(cfg)
-        print(f"verify: intended settings from {rep.name} (profile {s['profile']})")
+    elif rep.is_file():
+        rep_data = None
+        try:
+            rep_data = json.loads(rep.read_text())
+        except (OSError, ValueError):
+            rep_data = None
+        s = rep_data.get("settings") if isinstance(rep_data, dict) else None
+        if isinstance(s, dict):
+            cfg.update({"profile": s["profile"], "fit": f"{s['fit']['contour']},{s['fit']['hole']}",
+                        "set": [f"{k}={v}" for k, v in s.get("set", {}).items()],
+                        "support_set": [f"{k}={v}" for k, v in s.get("support_set", {}).items()],
+                        "supports": s.get("supports"), "bridging": s.get("bridging"),
+                        "filaments": [], "_composer": None})
+            expected = _expected(cfg)
+            print(f"verify: intended settings from {rep.name} (profile {s['profile']})")
     for kv in args.expect or []:
         if "=" not in kv:
             raise SystemExit(f"--expect {kv!r}: expected KEY=VALUE")
@@ -1013,6 +1058,7 @@ def run_calibrate(args):
     compensation (Bambu honours it per object, not per part)."""
     cfg = config.load_config(preset=getattr(args, "preset", None))
     config.ensure_dirs(cfg)
+    sweep.maybe_sweep(cfg)
     _apply_options(cfg, args)
     threemf.composer(cfg)
     try:
@@ -1037,7 +1083,7 @@ def run_calibrate(args):
         fp = settings.load_profile("filament", spec)
         cfg["filaments"] = [spec]
         colour["rgb"] = (fp.get("colour") or "#CCCCCC").lstrip("#")
-    cfg["_composer"] = None
+        cfg["_composer"] = None
     _check_preset(cfg, threemf.composer(cfg))
     _check_profile(cfg, {"cal": colour})
     meshes, probe_report, bambu = _prepare_meshes(cfg, sorted(set(files)), _load_orient(None),
